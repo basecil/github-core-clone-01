@@ -16,8 +16,9 @@
 //                                  throws a clear Error on malformed input (the caller
 //                                  turns it into an unpack failure, never a crash)
 //   applyDelta(base, delta)      — apply a git delta instruction stream to base bytes
-//   buildPack(objects)           — a valid v2 pack of full objects, deterministic order
-//                                  (sorted by oid), SHA-1 trailer
+//   buildPack(objects, deflateCache?) — a valid v2 pack of full objects, deterministic
+//                                  order (sorted by oid), SHA-1 trailer; the optional
+//                                  cache memoises each object's zlib stream
 //   peelTag(repo, oid)           — follow a tag chain to the first non-tag object
 //                                  ({ oid, type }); a non-tag object peels to itself
 //   collectObjects(repo, wantOids, haveOids, options?)
@@ -36,7 +37,7 @@
 
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
-import { objectId, parseCommit, parseTree } from './git-object.ts';
+import { objectId, parsedCommit, treeEntries } from './git-object.ts';
 import type { GitObject, ObjectType, Repo } from './store.ts';
 
 /** A git object with its id attached (what parsePack returns, what buildPack takes). */
@@ -366,9 +367,11 @@ function writePackObjectHeader(type: ObjectType, size: number): Buffer {
 /**
  * Build a packfile from plain objects (no deltas). The order is deterministic (sorted
  * by oid) so a replay produces identical bytes. The trailer is SHA-1 over everything
- * before it.
+ * before it. `deflateCache` (the repo's, see store.ts) memoises each object's zlib
+ * stream: objects are immutable, so a deflated stream stays valid, and repeated
+ * fetches of the same tip (50 concurrent clones) deflate each object once.
  */
-export function buildPack(objects: readonly PackedObject[]): Buffer {
+export function buildPack(objects: readonly PackedObject[], deflateCache?: Map<string, Buffer>): Buffer {
   const sorted = [...objects].sort((a, b) => (a.oid < b.oid ? -1 : a.oid > b.oid ? 1 : 0));
   const deduped: PackedObject[] = [];
   const seen = new Set<string>();
@@ -385,7 +388,12 @@ export function buildPack(objects: readonly PackedObject[]): Buffer {
   parts.push(header);
   for (const object of deduped) {
     parts.push(writePackObjectHeader(object.type, object.data.length));
-    parts.push(deflateSync(object.data));
+    let deflated = deflateCache?.get(object.oid);
+    if (deflated === undefined) {
+      deflated = deflateSync(object.data);
+      deflateCache?.set(object.oid, deflated);
+    }
+    parts.push(deflated);
   }
   const body = Buffer.concat(parts);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
@@ -425,7 +433,7 @@ export function collectObjects(
       const object = get(oid);
       if (object === undefined || object.type !== 'tree') continue;
       into.add(oid);
-      for (const entry of parseTree(object.data)) {
+      for (const entry of treeEntries(repo, oid)) {
         if (entry.mode === '160000') continue;
         if (entry.mode === '40000') stack.push(entry.oid);
         else into.add(entry.oid);
@@ -469,9 +477,7 @@ export function collectObjects(
   for (let index = 0; index < queue.length; index += 1) {
     const [oid, d] = queue[index] as [string, number];
     if (bfsLimit !== undefined && d + 1 > bfsLimit - 1) continue;
-    const object = get(oid);
-    if (object === undefined || object.type !== 'commit') continue;
-    const parsed = parseCommit(object.data);
+    const parsed = parsedCommit(repo, oid);
     if (parsed === null) continue;
     for (const parent of parsed.parents) {
       if (!distance.has(parent)) {
@@ -509,9 +515,7 @@ export function collectObjects(
   for (const [oid, d] of distance) {
     if (!withinDepth(d)) continue;
     wantClosure.add(oid);
-    const object = get(oid);
-    if (object === undefined || object.type !== 'commit') continue;
-    const parsed = parseCommit(object.data);
+    const parsed = parsedCommit(repo, oid);
     if (parsed !== null) addTreeClosure(parsed.tree, wantClosure);
   }
 
@@ -535,10 +539,12 @@ export function collectObjects(
     if (object === undefined) continue;
     haveClosure.add(oid);
     if (object.type === 'commit') {
-      const parsed = parseCommit(object.data);
-      if (parsed !== null) addTreeClosure(parsed.tree, haveClosure);
-      if (!(haveOidSet.has(oid) && clientShallow.has(oid)) && parsed !== null) {
-        for (const parent of parsed.parents) haveStack.push(parent);
+      const parsed = parsedCommit(repo, oid);
+      if (parsed !== null) {
+        addTreeClosure(parsed.tree, haveClosure);
+        if (!(haveOidSet.has(oid) && clientShallow.has(oid))) {
+          for (const parent of parsed.parents) haveStack.push(parent);
+        }
       }
     } else if (object.type === 'tag') {
       const target = parseTagTarget(object.data);
@@ -578,9 +584,7 @@ export function collectObjects(
     // after this fetch: every parent is in this pack, or was already a have.
     // (Depth alone does not decide it: a pack can be empty — e.g. the tag fetch
     // after a deepen — and then the boundary must stay shallow.)
-    const object = get(oid);
-    if (object === undefined || object.type !== 'commit') continue;
-    const parsed = parseCommit(object.data);
+    const parsed = parsedCommit(repo, oid);
     if (parsed === null) continue;
     if (parsed.parents.length === 0) {
       unshallow.push(oid); // a root commit has no parents to fetch: it is complete

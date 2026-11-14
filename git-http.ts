@@ -47,10 +47,10 @@ import {
   touchRepo,
   type Repo,
 } from './store.ts';
-import { getObject, parseCommit, walkCommits } from './git-object.ts';
+import { getObject, parsedCommit, walkCommits } from './git-object.ts';
 import { buildPack, collectObjects, parsePack, peelTag } from './git-pack.ts';
 import { decodePktLinesAll, encodePktLine, encodePktLines, pktFlush, sidebandPackets } from './pktline.ts';
-import { sendError, sendNotFound } from './rest.ts';
+import { parseRequestUrl, sendError, sendNotFound, splitSegments, type ParsedRequestUrl } from './rest.ts';
 
 const ZERO_OID = '0'.repeat(40);
 const SHA40 = /^[0-9a-f]{40}$/i;
@@ -69,14 +69,6 @@ function oneLine(value: string): string {
 }
 
 // ── Request plumbing ──────────────────────────────────────────────────────────
-
-function parseUrl(req: IncomingMessage): URL {
-  try {
-    return new URL(req.url ?? '/', 'http://entry');
-  } catch {
-    return new URL('/', 'http://entry');
-  }
-}
 
 /** Read the request body (≤64 MB); throws on overflow. */
 async function readBody(req: IncomingMessage): Promise<Buffer> {
@@ -109,23 +101,12 @@ interface GitRoute {
   service: GitService;
 }
 
-function decodeSegment(segment: string): string {
-  try {
-    return decodeURIComponent(segment);
-  } catch {
-    return segment;
-  }
-}
-
 /**
  * /{owner}/{repo}.git/info/refs | /{owner}/{repo}.git/git-upload-pack |
  * /{owner}/{repo}.git/git-receive-pack — null for anything else.
  */
 function parseGitPath(pathname: string): GitRoute | null {
-  const segments = pathname
-    .split('/')
-    .filter((segment) => segment !== '')
-    .map(decodeSegment);
+  const segments = splitSegments(pathname);
   if (segments.length < 3) return null;
   const owner = segments[0] as string;
   const repoSegment = segments[1] as string;
@@ -150,7 +131,7 @@ function wantsV2(req: IncomingMessage): boolean {
 
 /** Handle one /{owner}/{repo}.git/* request. Always answers (never throws to the caller). */
 export async function handleGit(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const url = parseUrl(req);
+  const url = parseRequestUrl(req);
   const method = (req.method ?? 'GET').toUpperCase();
 
   try {
@@ -264,7 +245,7 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
   return encodePktLines([`# service=${service}\n`, 'flush', ...lines, 'flush']);
 }
 
-function handleInfoRefs(req: IncomingMessage, res: ServerResponse, repo: Repo, url: URL): void {
+function handleInfoRefs(req: IncomingMessage, res: ServerResponse, repo: Repo, url: ParsedRequestUrl): void {
   const service = url.searchParams.get('service');
   if (service === 'git-upload-pack') {
     const body = wantsV2(req) ? v2Advertisement() : v0Advertisement(repo, 'git-upload-pack');
@@ -425,12 +406,15 @@ function handleFetchV2(res: ServerResponse, repo: Repo, args: readonly string[])
   }
   // An ACK means "the server has this object" (canonical upload-pack ACKs every
   // have it holds, whether or not it is an ancestor of a want). `ready` means a
-  // common base was found and the packfile follows in this response.
+  // common base was found and the packfile follows in this response. `ready` is
+  // only consulted for a negotiation round with haves and no `done` — and
+  // commonHaves walks the whole history, so it is computed lazily: a haveless
+  // clone or a `done` fetch never pays for the walk.
   const existingHaves = fetch.haves
     .map((have) => have.toLowerCase())
     .filter((have) => getObject(repo, have) !== undefined);
-  const common = commonHaves(repo, fetch.wants, fetch.haves);
-  const ready = common.length > 0;
+  const needsCommon = !fetch.done && fetch.haves.length > 0;
+  const ready = needsCommon && commonHaves(repo, fetch.wants, fetch.haves).length > 0;
 
   // Negotiation round with no common base and no `done`: send ONLY the ack
   // section and end the response with a flush. Real git then sends a follow-up
@@ -458,7 +442,7 @@ function handleFetchV2(res: ServerResponse, repo: Repo, args: readonly string[])
     shallow: new Set(fetch.shallow),
     filter: fetch.filter,
   });
-  const pack = buildPack(objects);
+  const pack = buildPack(objects, repo.deflatedObjects);
 
   // Sections are separated by DELIM packets (0001); a single FLUSH (0000) ends the
   // whole response. A flush between sections would end the response early — real git
@@ -505,8 +489,9 @@ function handleUploadPackV0(res: ServerResponse, repo: Repo, body: Buffer): void
     shallow: new Set(fetch.shallow),
     filter: fetch.filter,
   });
-  const pack = buildPack(objects);
-  const common = commonHaves(repo, fetch.wants, fetch.haves);
+  const pack = buildPack(objects, repo.deflatedObjects);
+  // With no haves there is no common base by definition: NAK without the walk.
+  const common = fetch.haves.length === 0 ? [] : commonHaves(repo, fetch.wants, fetch.haves);
 
   const head: string[] = [];
   for (const oid of shallow) head.push(`shallow ${oid}\n`);
@@ -543,9 +528,7 @@ function isAncestor(repo: Repo, ancestor: string, tip: string): boolean {
     if (oid === ancestor) return true;
     if (seen.has(oid)) continue;
     seen.add(oid);
-    const object = getObject(repo, oid);
-    if (object === undefined || object.type !== 'commit') continue;
-    const parsed = parseCommit(object.data);
+    const parsed = parsedCommit(repo, oid);
     if (parsed === null) continue;
     for (const parent of parsed.parents) stack.push(parent);
   }

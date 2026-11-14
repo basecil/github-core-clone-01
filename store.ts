@@ -78,6 +78,7 @@
 //   getPullRequest(repo, number) — PullRequest | undefined
 
 import type { IncomingMessage } from 'node:http';
+import type { ParsedCommit, TreeEntry } from './git-object.ts';
 
 // ── Viewer learning ─────────────────────────────────────────────────────────────
 
@@ -247,6 +248,17 @@ export interface Repo {
   refs: Map<string, string>;
   /** HEAD target branch (starts as the default branch). */
   headBranch: string;
+  /**
+   * Memoised parses of stored objects (git-object.ts). Objects are content-addressed
+   * and immutable — once stored, an oid's bytes never change and are never removed
+   * except with the whole repo — so a positive parse result stays valid for the
+   * repo's lifetime and needs no invalidation. Only positive results are cached:
+   * a missing oid may appear later (a push), so misses are never stored.
+   */
+  parsedCommits: Map<string, ParsedCommit | null>;
+  parsedTrees: Map<string, TreeEntry[]>;
+  /** Memoised zlib streams per object (git-pack.ts buildPack): same immutability argument. */
+  deflatedObjects: Map<string, Buffer>;
 }
 
 // ── Global counters + registries ────────────────────────────────────────────────
@@ -330,6 +342,9 @@ export function createRepo(input: { name: string; private: boolean; description:
     objects: new Map(),
     refs: new Map(),
     headBranch: input.default_branch,
+    parsedCommits: new Map(),
+    parsedTrees: new Map(),
+    deflatedObjects: new Map(),
   };
   reposByName.set(repo.name, repo);
   reposInOrder.push(repo);

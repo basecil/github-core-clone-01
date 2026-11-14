@@ -44,7 +44,7 @@ import {
   createTree,
   flattenTree,
   getObject,
-  parseCommit,
+  parsedCommit,
   updateTree,
   walkCommits,
 } from './git-object.ts';
@@ -128,9 +128,7 @@ export function findMergeBase(repo: Repo, a: string, b: string): string | null {
     if (ancestorsA.has(oid)) return oid;
     if (seen.has(oid)) continue;
     seen.add(oid);
-    const object = getObject(repo, oid);
-    if (object === undefined || object.type !== 'commit') continue;
-    const parsed = parseCommit(object.data);
+    const parsed = parsedCommit(repo, oid);
     if (parsed === null) continue;
     for (const parent of parsed.parents) queue.push(parent);
   }

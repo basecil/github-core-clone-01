@@ -17,7 +17,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { handleGit } from './git-http.ts';
 import { handleGraphQL } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
-import { handleRest, sendError, sendJson, sendNotFound } from './rest.ts';
+import { handleRest, parseRequestUrl, sendError, sendJson, sendNotFound } from './rest.ts';
 
 type Handler = (req: IncomingMessage, res: ServerResponse) => Promise<void> | void;
 
@@ -46,11 +46,7 @@ const mounts: readonly Mount[] = [
 
 /** The path of a request URL, or '/' when it does not parse (never a throw). */
 function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
-  }
+  return parseRequestUrl(req).pathname;
 }
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */

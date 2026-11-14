@@ -16,6 +16,10 @@
 //                                        — commit oid; message stored verbatim
 //   parseCommit(data)                    — ParsedCommit { tree, parents, author,
 //                                          committer, message }
+//   parsedCommit(repo, oid)              — parseCommit, memoised on the repo (null for
+//                                          a missing oid, a non-commit, or a malformed
+//                                          commit); objects are immutable, so no
+//                                          invalidation is ever needed
 //   treeEntries(repo, treeOid)           — direct entries of a tree ([] when missing)
 //   getTreeEntry(repo, treeOid, path)    — { oid, mode } for a file path, or undefined
 //   getTreeAtPath(repo, treeOid, path)   — subtree oid for a directory path
@@ -163,11 +167,34 @@ export function parseCommit(data: Buffer): ParsedCommit | null {
   return { tree, parents, author, committer, message };
 }
 
-/** Direct entries of a tree (empty when the oid is missing or not a tree). */
+/**
+ * The parsed commit for `oid`, memoised on the repo (see store.ts Repo.parsedCommits).
+ * Returns null for a missing oid, a non-commit object, or a malformed commit — exactly
+ * the cases where `getObject` + type check + `parseCommit` would yield no parse. Only
+ * positive results are cached (a missing oid may arrive later via a push); the result
+ * is immutable (objects are content-addressed), so callers must not mutate it.
+ */
+export function parsedCommit(repo: Repo, oid: string): ParsedCommit | null {
+  const key = oid.toLowerCase();
+  const cached = repo.parsedCommits.get(key);
+  if (cached !== undefined) return cached;
+  const object = getObject(repo, key);
+  if (object === undefined) return null; // never cache a miss: the object may arrive later
+  const parsed = object.type === 'commit' ? parseCommit(object.data) : null;
+  repo.parsedCommits.set(key, parsed);
+  return parsed;
+}
+
+/** Direct entries of a tree (empty when the oid is missing or not a tree). Memoised on the repo. */
 export function treeEntries(repo: Repo, treeOid: string): TreeEntry[] {
-  const object = getObject(repo, treeOid);
-  if (object === undefined || object.type !== 'tree') return [];
-  return parseTree(object.data);
+  const key = treeOid.toLowerCase();
+  const cached = repo.parsedTrees.get(key);
+  if (cached !== undefined) return cached;
+  const object = getObject(repo, key);
+  if (object === undefined || object.type !== 'tree') return []; // never cache a miss
+  const entries = parseTree(object.data);
+  repo.parsedTrees.set(key, entries);
+  return entries;
 }
 
 /** The file entry at `path` under a tree, or undefined (missing path, or a directory). */
@@ -256,6 +283,7 @@ export function flattenTree(repo: Repo, treeOid: string): Map<string, { oid: str
 export function walkCommits(repo: Repo, tipOid: string): string[] {
   const discovered: string[] = [];
   const seen = new Set<string>();
+  const stamp = new Map<string, number>();
   const stack: string[] = [tipOid];
   while (stack.length > 0) {
     const oid = stack.pop() as string;
@@ -264,16 +292,14 @@ export function walkCommits(repo: Repo, tipOid: string): string[] {
     const object = getObject(repo, oid);
     if (object === undefined || object.type !== 'commit') continue;
     discovered.push(oid);
-    const parsed = parseCommit(object.data);
+    // One parse per commit (memoised): the timestamp is captured here, so the
+    // second parse pass the old code needed is gone. A malformed commit still
+    // lists (stamp 0), exactly as before.
+    const parsed = parsedCommit(repo, oid);
+    stamp.set(oid, parsed?.committer.timestamp ?? 0);
     if (parsed === null) continue;
     // Push in reverse so the first parent is visited first.
     for (let i = parsed.parents.length - 1; i >= 0; i -= 1) stack.push(parsed.parents[i] as string);
-  }
-  const stamp = new Map<string, number>();
-  for (const oid of discovered) {
-    const object = getObject(repo, oid);
-    const parsed = object === undefined ? null : parseCommit(object.data);
-    stamp.set(oid, parsed?.committer.timestamp ?? 0);
   }
   const order = new Map(discovered.map((oid, index) => [oid, index]));
   return [...discovered].sort((a, b) => {
@@ -300,16 +326,12 @@ export function resolveRef(repo: Repo, ref: string): string | undefined {
 
 /** The tree oid of a commit, or undefined when the oid is not a commit. */
 export function commitTreeOid(repo: Repo, commitOid: string): string | undefined {
-  const object = getObject(repo, commitOid);
-  if (object === undefined || object.type !== 'commit') return undefined;
-  return parseCommit(object.data)?.tree;
+  return parsedCommit(repo, commitOid)?.tree;
 }
 
 /** Author { name, email, date } of a commit for REST responses, or undefined. */
 export function commitAuthorOf(repo: Repo, commitOid: string): { name: string; email: string; date: string } | undefined {
-  const object = getObject(repo, commitOid);
-  if (object === undefined || object.type !== 'commit') return undefined;
-  const parsed = parseCommit(object.data);
+  const parsed = parsedCommit(repo, commitOid);
   if (parsed === null) return undefined;
   return {
     name: parsed.author.name,

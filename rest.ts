@@ -81,7 +81,7 @@ import {
   getObject,
   getTreeAtPath,
   getTreeEntry,
-  parseCommit,
+  parsedCommit,
   resolveRef,
   treeEntries,
   updateTree,
@@ -133,26 +133,104 @@ function originOf(req: IncomingMessage): string {
   return `http://${host}`;
 }
 
-function parseUrl(req: IncomingMessage): URL {
+/**
+ * What the handlers need from a request URL: the path and the query. `new URL`
+ * costs ~6 µs a call and every request pays for it twice (app.ts routes on the
+ * path, then the handler parses again), so the common case — a plain ASCII path
+ * with an ordinary query — is split by hand, and anything unusual falls back to
+ * `new URL`, which stays the definition of the answer. The fast path runs only
+ * when its result is provably identical to `new URL`'s:
+ *   * only characters the URL parser leaves untouched in a path/query (no space,
+ *     controls, `"<>`, backtick, `{|}^`, backslash, or non-ASCII);
+ *   * starts with a single `/` (a leading `//` would read a host, a scheme
+ *     would make it absolute-form, a relative target would resolve oddly —
+ *     the leading-slash requirement excludes all three at once);
+ *   * no dot segments (`/./`, `/../`, trailing `/.` or `/..`) and no `%2e`
+ *     (the URL parser normalises both away — `%2e` counts as a dot).
+ */
+export interface ParsedRequestUrl {
+  pathname: string;
+  searchParams: URLSearchParams;
+}
+
+const FAST_URL_CHARS = /^[A-Za-z0-9\-._~:/?#@!$&'()*+,;=%[\]]+$/;
+
+export function parseRequestUrl(req: IncomingMessage): ParsedRequestUrl {
+  const raw = req.url ?? '/';
+  if (
+    raw.startsWith('/') &&
+    !raw.startsWith('//') &&
+    FAST_URL_CHARS.test(raw) &&
+    !raw.includes('%2e') &&
+    !raw.includes('%2E')
+  ) {
+    let end = raw.length;
+    let query = '';
+    const q = raw.indexOf('?');
+    const h = raw.indexOf('#');
+    const cut = q === -1 ? h : h === -1 ? q : Math.min(q, h);
+    if (cut !== -1) {
+      end = cut;
+      if (raw[cut] === '?') {
+        const hashAfter = raw.indexOf('#', cut);
+        query = hashAfter === -1 ? raw.slice(cut + 1) : raw.slice(cut + 1, hashAfter);
+      }
+    }
+    const pathname = end === 0 ? '/' : raw.slice(0, end);
+    if (
+      !pathname.includes('/./') &&
+      !pathname.includes('/../') &&
+      !pathname.endsWith('/.') &&
+      !pathname.endsWith('/..')
+    ) {
+      // searchParams is built lazily: most requests (every bench read/write) never
+      // touch the query, so constructing URLSearchParams up front is pure waste.
+      // The getter memoises, so repeated access returns the same instance.
+      let params: URLSearchParams | null = null;
+      return {
+        pathname,
+        get searchParams(): URLSearchParams {
+          if (params === null) params = new URLSearchParams(query);
+          return params;
+        },
+      };
+    }
+  }
   try {
-    return new URL(req.url ?? '/', 'http://entry');
+    const url = new URL(raw, 'http://entry');
+    return { pathname: url.pathname, searchParams: url.searchParams };
   } catch {
-    return new URL('/', 'http://entry');
+    return { pathname: '/', searchParams: new URLSearchParams() };
   }
 }
 
-/** Path segments, percent-decoded, empty segments dropped (trailing slashes tolerated). */
-function segmentsOf(pathname: string): string[] {
-  return pathname
-    .split('/')
-    .filter((segment) => segment !== '')
-    .map((segment) => {
-      try {
-        return decodeURIComponent(segment);
-      } catch {
-        return segment;
+/**
+ * Path segments, percent-decoded, empty segments dropped (trailing slashes
+ * tolerated). A hand-rolled scan: the old split/filter/map allocated three
+ * arrays per request and decoded every segment even without a `%` (a segment
+ * with no `%` decodes to itself).
+ */
+export function splitSegments(pathname: string): string[] {
+  const out: string[] = [];
+  let start = 0;
+  for (let i = 0; i <= pathname.length; i += 1) {
+    if (i === pathname.length || pathname.charCodeAt(i) === 47 /* '/' */) {
+      if (i > start) {
+        const segment = pathname.slice(start, i);
+        if (segment.includes('%')) {
+          try {
+            out.push(decodeURIComponent(segment));
+          } catch {
+            out.push(segment);
+          }
+        } else {
+          out.push(segment);
+        }
       }
-    });
+      start = i + 1;
+    }
+  }
+  return out;
 }
 
 class MalformedBodyError extends Error {}
@@ -194,7 +272,7 @@ interface PageParams {
   page: number;
 }
 
-function pageParams(url: URL, defaultPerPage = 30): PageParams {
+function pageParams(url: ParsedRequestUrl, defaultPerPage = 30): PageParams {
   const rawPerPage = Number.parseInt(url.searchParams.get('per_page') ?? '', 10);
   const rawPage = Number.parseInt(url.searchParams.get('page') ?? '', 10);
   const perPage = Number.isFinite(rawPerPage) ? Math.min(100, Math.max(1, rawPerPage)) : defaultPerPage;
@@ -213,7 +291,7 @@ function paginate<T>(items: readonly T[], params: PageParams): { page: T[]; tota
  * request's query parameters (per_page/page are set to the target page). Null when
  * there is a single page. The client follows rel="next" only on the same origin.
  */
-function linkHeader(req: IncomingMessage, url: URL, params: PageParams, totalPages: number): string | null {
+function linkHeader(req: IncomingMessage, url: ParsedRequestUrl, params: PageParams, totalPages: number): string | null {
   if (totalPages <= 1) return null;
   const origin = originOf(req);
   const make = (page: number): string => {
@@ -330,9 +408,7 @@ function commentJson(comment: IssueComment, repo: Repo, issueNumber: number, ori
 }
 
 function commitJson(repo: Repo, oid: string, origin: string): JsonObject | null {
-  const object = getObject(repo, oid);
-  if (object === undefined || object.type !== 'commit') return null;
-  const parsed = parseCommit(object.data);
+  const parsed = parsedCommit(repo, oid);
   if (parsed === null) return null;
   const owner = repoOwnerLogin(repo);
   const author = {
@@ -390,7 +466,7 @@ function commitFileChange(
 }
 
 /** Resolve the ?ref= query (branch, full ref, or commit oid) to a commit oid. */
-function resolveContentsRef(repo: Repo, url: URL): string | undefined {
+function resolveContentsRef(repo: Repo, url: ParsedRequestUrl): string | undefined {
   const ref = url.searchParams.get('ref');
   if (ref === null || ref === '') return branchTip(repo, repo.default_branch);
   return resolveRef(repo, ref);
@@ -431,7 +507,7 @@ function fileEntryJson(
 
 /** Handle one /api/v3/* request. Always answers (never throws to the caller). */
 export async function handleRest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const url = parseUrl(req);
+  const url = parseRequestUrl(req);
   const method = (req.method ?? 'GET').toUpperCase();
   const origin = originOf(req);
 
@@ -442,7 +518,7 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse): Pro
       return;
     }
 
-    const segments = segmentsOf(url.pathname);
+    const segments = splitSegments(url.pathname);
     // segments[0] is 'api', segments[1] is 'v3'; the rest is the route.
     const route = segments.slice(2);
 
@@ -549,7 +625,7 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse): Pro
 async function handleRepoRoute(
   req: IncomingMessage,
   res: ServerResponse,
-  url: URL,
+  url: ParsedRequestUrl,
   method: string,
   repo: Repo,
   tail: string[],
@@ -717,7 +793,7 @@ async function handleRepoRoute(
 async function handleContents(
   req: IncomingMessage,
   res: ServerResponse,
-  url: URL,
+  url: ParsedRequestUrl,
   method: string,
   repo: Repo,
   filePath: string,
@@ -871,7 +947,7 @@ function resolveIssueLabels(repo: Repo, value: unknown): { labels: Label[]; unkn
 async function handleIssues(
   req: IncomingMessage,
   res: ServerResponse,
-  url: URL,
+  url: ParsedRequestUrl,
   method: string,
   repo: Repo,
   tail: string[],
@@ -990,7 +1066,7 @@ function branchOf(ref: string): string {
 async function handlePulls(
   req: IncomingMessage,
   res: ServerResponse,
-  url: URL,
+  url: ParsedRequestUrl,
   method: string,
   repo: Repo,
   tail: string[],
