@@ -1,10 +1,17 @@
-# github-core-clone-01 starter
+# github-core-clone-01
 
-A runnable starting point for [the contest](https://make.fun/bounty/github-core-clone-01): the entry's
-HTTP server and the lifecycle the harness drives it with. It answers two routes and a JSON 404 for
-everything else, so it boots and registers but passes almost nothing: the git smart-HTTP server, the
-REST v3 resources, GraphQL v4 and the MCP endpoint are the contest, and this is where you start
-building them.
+A GitHub-compatible git forge, built for [the contest](https://make.fun/bounty/github-core-clone-01):
+an in-memory store, a pure git object layer, and the REST v3 surface — repositories,
+branches, commits, contents, issues, comments and labels — over the lifecycle the
+harness drives it with. Git smart HTTP, GraphQL v4, pull-request merges and the MCP
+endpoint are being added slice by slice on top of the same store.
+
+Documented subset (what this build implements): REST v3 repositories, branches,
+commits, contents (create/update/delete with real git commits), issues, comments and
+labels, plus the protocol discipline every reply follows (JSON everywhere, a
+non-empty `X-GitHub-Request-Id`, bearer auth on all API routes except the health
+probe). No claim of full GitHub compatibility: pull requests, GraphQL, MCP and git
+smart HTTP are not in this slice yet.
 
 ## Run it
 
@@ -43,15 +50,15 @@ there is nothing to talk to, so `main.ts` exits 1 at once.
 | --- | --- |
 | `GET /healthz` | 200 `{"ok":true}`: the env's boot probe, called twice |
 | `GET /api/v3/` | 200, `X-Oauth-Scopes: repo, read:org`, a JSON API root |
-| `/api/v3/...` | GitHub REST v3: repositories, branches, commits, contents, issues, comments, labels, pull requests, files, merges |
+| `/api/v3/...` | GitHub REST v3: repositories, branches, commits, contents, issues, comments, labels — implemented in this slice (pull requests arrive in a later slice) |
 | `POST /api/graphql` | GitHub GraphQL v4: the documents `gh` and `github-mcp-server` send |
 | `POST /mcp` | Model Context Protocol over streamable HTTP: initialize, tools/list, tools/call |
 | `/<owner>/<repo>.git/...` | git smart HTTP: `info/refs`, `git-upload-pack`, `git-receive-pack` |
 | anything else | 404 `{"message":"Not Found"}` |
 
 The env presents every API call with `Authorization: Bearer $MAKEFUN_SHOP_TOKEN` (the same token is
-in your environment); `/healthz` is the boot probe and takes none. Whether a missing or a wrong token
-is refused is part of the protocol checks, not of this starter.
+in your environment); `/healthz` is the boot probe and takes none. A missing or a wrong token is
+refused with a JSON 401 on every API route.
 
 The score is `feature + agent + perf` (0..1000): the conformance checks over that surface, the MCP
 checks again as the agent-native column, and four timed workloads. The version of the suite the trial
@@ -69,7 +76,14 @@ The trial's CPU, memory and process limits are the rules'; its wall budget is 90
 ## Layout
 
 - `main.ts`: the lifecycle above. Keep it as it is.
-- `app.ts`: the server. This is the file to grow.
+- `app.ts`: the server and its mount table (REST v3 mounted; GraphQL, MCP and git
+  smart HTTP are JSON-404 stubs until later slices mount them).
+- `store.ts`: the shared in-memory store + data model — the contract later slices
+  build on. Viewer-login learning, the deterministic logical clock and request ids,
+  bearer auth, repos/issues/comments/labels/pull-request records.
+- `git-object.ts`: the pure git object layer (SHA-1 ids, blobs/trees/commits, tree
+  updates, commit traversal). No packs or smart HTTP here yet.
+- `rest.ts`: the REST v3 handlers, JSON/error/pagination helpers, and the serializers.
 - `package.json`, `tsconfig.json`, `LICENSE` (MIT): the entry's metadata and licence.
 
 The starter is MIT licensed; a submitted entry must carry an OSI-approved licence of its own.

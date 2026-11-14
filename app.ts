@@ -1,22 +1,54 @@
-// The starter's HTTP surface, exactly as it ships: a health probe and an API root, and a JSON 404
-// for everything else. The contest's real surface — git smart HTTP, REST v3 resources, GraphQL v4 and
-// the MCP endpoint — is what you add (README.md names it, and the rules link below says what scores).
+// app.ts — the forge's HTTP server: health probe, API root, and the mount table.
 //
-// app.ts is deliberately separate from main.ts: this is the server, the file you grow; main.ts is the
-// entry <-> env lifecycle and should stay as it is.
+// The router is a `mounts` table: one line per prefix, so later slices mount their
+// real handlers (GraphQL v4, MCP, git smart HTTP) by replacing a stub entry — the
+// dispatch logic below never changes.
+//
+//   GET /healthz        200 {"ok":true}, no auth (the env's boot probe)
+//   /api/v3/*           REST v3 (rest.ts)
+//   /api/graphql        GraphQL v4 — STUB (JSON 404) until a later slice mounts it
+//   /mcp                MCP over streamable HTTP — STUB (JSON 404) until a later slice
+//   /*.git/*            git smart HTTP — STUB (JSON 404) until a later slice mounts it
+//   anything else       404 {"message":"Not Found"} (JSON, with a request id)
+//
+// Every reply is JSON and carries X-GitHub-Request-Id (see rest.ts sendJson).
+// A handler that throws answers 500 JSON; the server stays up.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { handleRest, sendError, sendJson, sendNotFound } from './rest.ts';
 
-const JSON_TYPE = 'application/json; charset=utf-8';
+type Handler = (req: IncomingMessage, res: ServerResponse) => Promise<void> | void;
 
-/** Answer one request with a JSON body; `headers` go beside the JSON ones. */
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
-  res.end(text);
+interface Mount {
+  /** Human name for the mount (logs/diagnostics only). */
+  name: string;
+  /** True when this mount owns the request path. */
+  test: (path: string) => boolean;
+  /** The handler; stubs answer the standard JSON 404 until replaced. */
+  handler: Handler;
 }
 
-/** The path of a request URL, or '/' when it does not parse (never a throw from a request). */
+/** A stub mount: the standard JSON 404 until a later slice replaces this entry. */
+function stub404(_req: IncomingMessage, res: ServerResponse): void {
+  sendNotFound(res);
+}
+
+/**
+ * The mount table — one line per prefix. Later slices replace a stub's `handler`
+ * with the real one; nothing else in this file needs to change.
+ */
+const mounts: readonly Mount[] = [
+  { name: 'rest-v3', test: (path) => path === '/api/v3' || path.startsWith('/api/v3/'), handler: handleRest },
+  { name: 'graphql-v4', test: (path) => path === '/api/graphql' || path.startsWith('/api/graphql/'), handler: stub404 },
+  { name: 'mcp', test: (path) => path === '/mcp' || path.startsWith('/mcp/'), handler: stub404 },
+  {
+    name: 'git-smart-http',
+    test: (path) => path.includes('.git/') || path.endsWith('.git'),
+    handler: stub404,
+  },
+];
+
+/** The path of a request URL, or '/' when it does not parse (never a throw). */
 function pathOf(req: IncomingMessage): string {
   try {
     return new URL(req.url ?? '/', 'http://entry').pathname;
@@ -27,23 +59,40 @@ function pathOf(req: IncomingMessage): string {
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     const path = pathOf(req);
     const method = req.method ?? 'GET';
 
-    // The env's boot check calls this twice: 200 {"ok":true}.
+    // The env's boot check calls this twice: 200 {"ok":true}, no auth.
     if (method === 'GET' && path === '/healthz') {
       sendJson(res, 200, { ok: true });
       return;
     }
 
-    // The GitHub API root: a 200 with the token's scopes, as api.github.com answers GET /.
-    if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
-      sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
+    for (const mount of mounts) {
+      if (!mount.test(path)) continue;
+      Promise.resolve()
+        .then(() => mount.handler(req, res))
+        .catch(() => {
+          // A handler bug must never take the server down or hang the client.
+          if (!res.headersSent) sendError(res, 500, 'Internal Server Error');
+          else res.end();
+        });
       return;
     }
 
     // Everything else, every method: GitHub's 404 body.
-    sendJson(res, 404, { message: 'Not Found' });
+    sendNotFound(res);
   });
+
+  // A malformed HTTP request line still gets a JSON answer, not a bare socket close.
+  server.on('clientError', (err: Error, socket) => {
+    const body = `${JSON.stringify({ message: 'Bad Request' })}\n`;
+    socket.end(
+      `HTTP/1.1 400 Bad Request\r\ncontent-type: application/json; charset=utf-8\r\ncontent-length: ${Buffer.byteLength(body)}\r\nconnection: close\r\n\r\n${body}`,
+    );
+    void err;
+  });
+
+  return server;
 }
