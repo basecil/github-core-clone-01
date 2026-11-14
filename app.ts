@@ -1,13 +1,11 @@
 // app.ts — the forge's HTTP server: health probe, API root, and the mount table.
 //
-// The router is a `mounts` table: one line per prefix, so later slices mount their
-// real handlers (GraphQL v4, MCP, git smart HTTP) by replacing a stub entry — the
-// dispatch logic below never changes.
+// The router is a `mounts` table: one line per prefix.
 //
 //   GET /healthz        200 {"ok":true}, no auth (the env's boot probe)
 //   /api/v3/*           REST v3 (rest.ts), including pull requests (pulls.ts)
-//   /api/graphql        GraphQL v4 — STUB (JSON 404) until a later slice mounts it
-//   /mcp                MCP over streamable HTTP — STUB (JSON 404) until a later slice
+//   /api/graphql        GraphQL v4 (graphql.ts)
+//   /mcp                MCP over streamable HTTP (mcp.ts)
 //   /*.git/*            git smart HTTP (git-http.ts): protocol v2 upload-pack,
 //                       v0 receive-pack, info/refs advertisements
 //   anything else       404 {"message":"Not Found"} (JSON, with a request id)
@@ -17,6 +15,8 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { handleGit } from './git-http.ts';
+import { handleGraphQL } from './graphql.ts';
+import { handleMcp } from './mcp.ts';
 import { handleRest, sendError, sendJson, sendNotFound } from './rest.ts';
 
 type Handler = (req: IncomingMessage, res: ServerResponse) => Promise<void> | void;
@@ -26,23 +26,17 @@ interface Mount {
   name: string;
   /** True when this mount owns the request path. */
   test: (path: string) => boolean;
-  /** The handler; stubs answer the standard JSON 404 until replaced. */
+  /** The handler for this mount. */
   handler: Handler;
 }
 
-/** A stub mount: the standard JSON 404 until a later slice replaces this entry. */
-function stub404(_req: IncomingMessage, res: ServerResponse): void {
-  sendNotFound(res);
-}
-
 /**
- * The mount table — one line per prefix. Later slices replace a stub's `handler`
- * with the real one; nothing else in this file needs to change.
+ * The mount table — one line per prefix.
  */
 const mounts: readonly Mount[] = [
   { name: 'rest-v3', test: (path) => path === '/api/v3' || path.startsWith('/api/v3/'), handler: handleRest },
-  { name: 'graphql-v4', test: (path) => path === '/api/graphql' || path.startsWith('/api/graphql/'), handler: stub404 },
-  { name: 'mcp', test: (path) => path === '/mcp' || path.startsWith('/mcp/'), handler: stub404 },
+  { name: 'graphql-v4', test: (path) => path === '/api/graphql' || path.startsWith('/api/graphql/'), handler: handleGraphQL },
+  { name: 'mcp', test: (path) => path === '/mcp' || path.startsWith('/mcp/'), handler: handleMcp },
   {
     name: 'git-smart-http',
     test: (path) => path.includes('.git/') || path.endsWith('.git'),
