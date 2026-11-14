@@ -26,7 +26,13 @@
 //   PATCH  /repos/{o}/{r}/issues/{n}  200 (state / title / body / labels)
 //   POST   /repos/{o}/{r}/issues/{n}/comments  201 {id, body}
 //   GET    /repos/{o}/{r}/issues/{n}/comments  200 list
-//   (pulls live in a later slice; their routes 404 JSON for now)
+//   POST   /repos/{o}/{r}/pulls                201; unknown head/base branch → 422
+//   GET    /repos/{o}/{r}/pulls[?state=]       paginated (default state=open)
+//   GET    /repos/{o}/{r}/pulls/{n}            200 / 404
+//   GET    /repos/{o}/{r}/pulls/{n}/files      200 [{filename, status, additions,
+//                                              deletions, changes}]
+//   PUT    /repos/{o}/{r}/pulls/{n}/merge      200 {merged:true, sha, message};
+//                                              conflict / already merged → 405
 //
 // ── Protocol discipline ────────────────────────────────────────────────────────
 //   * Every reply is application/json (never HTML), including errors.
@@ -43,10 +49,12 @@ import {
   createComment,
   createIssue,
   createOrUpdateLabel,
+  createPullRequest,
   createRepo,
   deleteRepo,
   findLabel,
   getIssue,
+  getPullRequest,
   getRepoByName,
   isViewer,
   learnOwner,
@@ -79,6 +87,7 @@ import {
   updateTree,
   walkCommits,
 } from './git-object.ts';
+import { computePullFiles, mergePullRequestRecord, pullJson } from './pulls.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const MAX_BODY_BYTES = 10 * 1024 * 1024;
@@ -694,7 +703,12 @@ async function handleRepoRoute(
     return;
   }
 
-  // Pulls arrive in a later slice; until then they are unknown routes (JSON 404).
+  // /repos/{o}/{r}/pulls[/{n}[/files|merge]]
+  if (head === 'pulls') {
+    await handlePulls(req, res, url, method, repo, tail.slice(1), origin);
+    return;
+  }
+
   return sendNotFound(res);
 }
 
@@ -960,6 +974,108 @@ async function handleIssues(
       return;
     }
     return sendNotFound(res);
+  }
+
+  return sendNotFound(res);
+}
+
+// ── Pulls ─────────────────────────────────────────────────────────────────────
+
+/** GitHub accepts `head` as "branch" or "user:branch"; the store wants the branch. */
+function branchOf(ref: string): string {
+  const colon = ref.lastIndexOf(':');
+  return colon === -1 ? ref : ref.slice(colon + 1);
+}
+
+async function handlePulls(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  method: string,
+  repo: Repo,
+  tail: string[],
+  origin: string,
+): Promise<void> {
+  // /repos/{o}/{r}/pulls
+  if (tail.length === 0) {
+    if (method === 'POST') {
+      const body = await readJsonBody(req);
+      const title = asString(body.title);
+      const headRaw = asString(body.head);
+      const baseRaw = asString(body.base);
+      if (title === undefined || title.trim() === '') {
+        sendError(res, 422, 'Validation Failed: title is required');
+        return;
+      }
+      if (headRaw === undefined || headRaw === '' || baseRaw === undefined || baseRaw === '') {
+        sendError(res, 422, 'Validation Failed: head and base are required');
+        return;
+      }
+      const pull = createPullRequest(repo, {
+        title,
+        body: asString(body.body) ?? '',
+        headRef: branchOf(headRaw),
+        baseRef: branchOf(baseRaw),
+      });
+      if (pull === null) {
+        sendError(res, 422, 'Validation Failed: head or base branch does not exist');
+        return;
+      }
+      sendJson(res, 201, pullJson(pull, repo, origin));
+      return;
+    }
+    if (method === 'GET') {
+      const state = url.searchParams.get('state') ?? 'open';
+      let list = [...repo.pullRequests];
+      if (state === 'open' || state === 'closed') list = list.filter((pull) => pull.state === state);
+      // Newest first (created order is number order: every created_at takes the next tick).
+      list.sort((a, b) => b.number - a.number);
+      const params = pageParams(url);
+      const { page, totalPages } = paginate(list, params);
+      const link = linkHeader(req, url, params, totalPages);
+      sendJson(res, 200, page.map((pull) => pullJson(pull, repo, origin)), link === null ? {} : { link });
+      return;
+    }
+    return sendNotFound(res);
+  }
+
+  // /repos/{o}/{r}/pulls/{n}[/files|merge]
+  const number = Number.parseInt(tail[0] as string, 10);
+  if (!Number.isInteger(number) || number < 1) return sendNotFound(res);
+  const pull = getPullRequest(repo, number);
+  if (pull === undefined) return sendNotFound(res);
+
+  if (tail.length === 1) {
+    if (method !== 'GET') return sendNotFound(res);
+    sendJson(res, 200, pullJson(pull, repo, origin));
+    return;
+  }
+
+  if (tail.length === 2 && tail[1] === 'files') {
+    if (method !== 'GET') return sendNotFound(res);
+    sendJson(res, 200, computePullFiles(repo, pull));
+    return;
+  }
+
+  if (tail.length === 2 && tail[1] === 'merge') {
+    if (method !== 'PUT') return sendNotFound(res);
+    const body = await readJsonBody(req);
+    const methodRaw = asString(body.merge_method);
+    const mergeMethod = methodRaw === undefined ? 'squash' : methodRaw;
+    if (mergeMethod !== 'squash' && mergeMethod !== 'merge') {
+      sendError(res, 422, 'Validation Failed: merge_method must be squash or merge');
+      return;
+    }
+    const result = mergePullRequestRecord(repo, pull, mergeMethod, {
+      commitTitle: asString(body.commit_title),
+      commitMessage: asString(body.commit_message),
+    });
+    if (!result.ok) {
+      sendError(res, result.status, result.message);
+      return;
+    }
+    sendJson(res, 200, { merged: true, sha: result.sha, message: 'Pull request successfully merged' });
+    return;
   }
 
   return sendNotFound(res);

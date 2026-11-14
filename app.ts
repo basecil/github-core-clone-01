@@ -5,16 +5,18 @@
 // dispatch logic below never changes.
 //
 //   GET /healthz        200 {"ok":true}, no auth (the env's boot probe)
-//   /api/v3/*           REST v3 (rest.ts)
+//   /api/v3/*           REST v3 (rest.ts), including pull requests (pulls.ts)
 //   /api/graphql        GraphQL v4 — STUB (JSON 404) until a later slice mounts it
 //   /mcp                MCP over streamable HTTP — STUB (JSON 404) until a later slice
-//   /*.git/*            git smart HTTP — STUB (JSON 404) until a later slice mounts it
+//   /*.git/*            git smart HTTP (git-http.ts): protocol v2 upload-pack,
+//                       v0 receive-pack, info/refs advertisements
 //   anything else       404 {"message":"Not Found"} (JSON, with a request id)
 //
 // Every reply is JSON and carries X-GitHub-Request-Id (see rest.ts sendJson).
 // A handler that throws answers 500 JSON; the server stays up.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { handleGit } from './git-http.ts';
 import { handleRest, sendError, sendJson, sendNotFound } from './rest.ts';
 
 type Handler = (req: IncomingMessage, res: ServerResponse) => Promise<void> | void;
@@ -44,7 +46,7 @@ const mounts: readonly Mount[] = [
   {
     name: 'git-smart-http',
     test: (path) => path.includes('.git/') || path.endsWith('.git'),
-    handler: stub404,
+    handler: handleGit,
   },
 ];
 

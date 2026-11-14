@@ -1,17 +1,23 @@
 # github-core-clone-01
 
 A GitHub-compatible git forge, built for [the contest](https://make.fun/bounty/github-core-clone-01):
-an in-memory store, a pure git object layer, and the REST v3 surface — repositories,
-branches, commits, contents, issues, comments and labels — over the lifecycle the
-harness drives it with. Git smart HTTP, GraphQL v4, pull-request merges and the MCP
-endpoint are being added slice by slice on top of the same store.
+an in-memory store, a pure git object layer, the REST v3 surface — repositories,
+branches, commits, contents, issues, comments, labels and pull requests — and git
+smart HTTP (protocol v2 upload-pack, v0 receive-pack, packfile codec) over the
+lifecycle the harness drives it with. GraphQL v4 and the MCP endpoint are being
+added slice by slice on top of the same store.
 
 Documented subset (what this build implements): REST v3 repositories, branches,
-commits, contents (create/update/delete with real git commits), issues, comments and
-labels, plus the protocol discipline every reply follows (JSON everywhere, a
-non-empty `X-GitHub-Request-Id`, bearer auth on all API routes except the health
-probe). No claim of full GitHub compatibility: pull requests, GraphQL, MCP and git
-smart HTTP are not in this slice yet.
+commits, contents (create/update/delete with real git commits), issues, comments,
+labels and pull requests (create/list/get/files, squash + merge merges with
+three-way conflict detection), plus git smart HTTP — `info/refs` advertisements
+(protocol v2 for upload-pack, v0 for receive-pack), `ls-refs` with peel/symrefs/
+unborn/ref-prefix, fetches with want/have negotiation, shallow/deepen and sideband-
+64k framing, and pushes with unpack-then-validate report-status (fast-forward
+enforcement, per-ref ok/ng) — plus the protocol discipline every reply follows
+(JSON everywhere on the REST surface, a non-empty `X-GitHub-Request-Id`, bearer
+auth on all API routes except the health probe). No claim of full GitHub
+compatibility: GraphQL and MCP are not in this slice yet.
 
 ## Run it
 
@@ -50,10 +56,10 @@ there is nothing to talk to, so `main.ts` exits 1 at once.
 | --- | --- |
 | `GET /healthz` | 200 `{"ok":true}`: the env's boot probe, called twice |
 | `GET /api/v3/` | 200, `X-Oauth-Scopes: repo, read:org`, a JSON API root |
-| `/api/v3/...` | GitHub REST v3: repositories, branches, commits, contents, issues, comments, labels — implemented in this slice (pull requests arrive in a later slice) |
+| `/api/v3/...` | GitHub REST v3: repositories, branches, commits, contents, issues, comments, labels, pull requests (create/list/get/files/merge) |
 | `POST /api/graphql` | GitHub GraphQL v4: the documents `gh` and `github-mcp-server` send |
 | `POST /mcp` | Model Context Protocol over streamable HTTP: initialize, tools/list, tools/call |
-| `/<owner>/<repo>.git/...` | git smart HTTP: `info/refs`, `git-upload-pack`, `git-receive-pack` |
+| `/<owner>/<repo>.git/...` | git smart HTTP: `info/refs` (v2 upload-pack / v0 receive-pack advertisements), `git-upload-pack` (v2 ls-refs + fetch, v0 fetch), `git-receive-pack` (v0 push with report-status) |
 | anything else | 404 `{"message":"Not Found"}` |
 
 The env presents every API call with `Authorization: Bearer $MAKEFUN_SHOP_TOKEN` (the same token is
@@ -76,13 +82,22 @@ The trial's CPU, memory and process limits are the rules'; its wall budget is 90
 ## Layout
 
 - `main.ts`: the lifecycle above. Keep it as it is.
-- `app.ts`: the server and its mount table (REST v3 mounted; GraphQL, MCP and git
-  smart HTTP are JSON-404 stubs until later slices mount them).
+- `app.ts`: the server and its mount table (REST v3 and git smart HTTP mounted;
+  GraphQL and MCP are JSON-404 stubs until later slices mount them).
 - `store.ts`: the shared in-memory store + data model — the contract later slices
   build on. Viewer-login learning, the deterministic logical clock and request ids,
   bearer auth, repos/issues/comments/labels/pull-request records.
 - `git-object.ts`: the pure git object layer (SHA-1 ids, blobs/trees/commits, tree
-  updates, commit traversal). No packs or smart HTTP here yet.
+  updates, commit traversal). No packs or smart HTTP here.
+- `git-pack.ts`: the packfile codec (parse v2/v3 packs with OFS/REF deltas, build
+  deterministic full-object v2 packs) and the fetch reachability collection
+  (want/have, shallow/deepen, filters).
+- `pktline.ts`: git pkt-line framing + sideband-64k helpers shared by the server.
+- `git-http.ts`: git smart HTTP — info/refs advertisements, protocol v2 upload-pack
+  (ls-refs, fetch), v0 fetch, and v0 receive-pack pushes with report-status.
+- `pulls.ts`: pull-request files diff (LCS line counts) and merge logic (squash +
+  merge, three-way file-granularity conflict detection), shared by REST v3 and the
+  later GraphQL/MCP slices.
 - `rest.ts`: the REST v3 handlers, JSON/error/pagination helpers, and the serializers.
 - `package.json`, `tsconfig.json`, `LICENSE` (MIT): the entry's metadata and licence.
 
