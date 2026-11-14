@@ -249,6 +249,50 @@ export function mergePullRequestRecord(
   return { ok: true, sha };
 }
 
+// ── Mergeability (pure dry-run, for the GraphQL `mergeable` field) ────────────
+
+/** GitHub's MergeableState enum, as the GraphQL `mergeable` field answers it. */
+export type MergeableState = 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN';
+
+/**
+ * The pull request's mergeability WITHOUT mutating anything: the same three-way
+ * file-granularity conflict check the merge runs (base-tip tree vs head-tip tree
+ * against the merge-base tree), but it only compares versions and never builds
+ * the result tree. A closed pull request, a missing tip, or a head already
+ * reachable from the base is UNKNOWN (there is nothing left to merge).
+ */
+export function mergeableState(repo: Repo, pull: PullRequest): MergeableState {
+  if (pull.state === 'closed') return 'UNKNOWN';
+  const baseTip = sideTip(repo, pull.base);
+  const headTip = sideTip(repo, pull.head);
+  const baseObject = getObject(repo, baseTip);
+  const headObject = getObject(repo, headTip);
+  if (baseObject === undefined || baseObject.type !== 'commit' || headObject === undefined || headObject.type !== 'commit') {
+    return 'UNKNOWN';
+  }
+  if (headTip === baseTip || walkCommits(repo, baseTip).includes(headTip)) return 'UNKNOWN';
+
+  const mergeBase = findMergeBase(repo, baseTip, headTip);
+  const ancestorMap = mergeBase === null ? new Map<string, { oid: string; mode: string }>() : treeFiles(repo, mergeBase);
+  const baseMap = treeFiles(repo, baseTip);
+  const headMap = treeFiles(repo, headTip);
+  const versionOf = (map: Map<string, { oid: string; mode: string }>, path: string): string | null => {
+    const entry = map.get(path);
+    return entry === undefined ? null : `${entry.oid}:${entry.mode}`;
+  };
+  const allPaths = new Set([...ancestorMap.keys(), ...baseMap.keys(), ...headMap.keys()]);
+  for (const path of [...allPaths].sort()) {
+    const ancestorVersion = versionOf(ancestorMap, path);
+    const baseVersion = versionOf(baseMap, path);
+    const headVersion = versionOf(headMap, path);
+    if (baseVersion === headVersion) continue;
+    if (baseVersion === ancestorVersion) continue; // only the head side changed
+    if (headVersion === ancestorVersion) continue; // only the base side changed
+    return 'CONFLICTING'; // both sides changed the path differently
+  }
+  return 'MERGEABLE';
+}
+
 // ── Serializer ────────────────────────────────────────────────────────────────
 
 /** The REST v3 pull-request shape (the checks assert number/state/title/body/head/base). */
