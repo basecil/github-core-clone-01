@@ -39,11 +39,14 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
+  bumpGeneration,
   checkAuth,
+  getCachedFetch,
   getRepoByName,
   isViewer,
   learnOwner,
   nextRequestId,
+  setCachedFetch,
   touchRepo,
   type Repo,
 } from './store.ts';
@@ -206,17 +209,19 @@ function peeledOid(repo: Repo, oid: string): string | null {
   return peeled.oid === oid ? null : peeled.oid;
 }
 
-/** The protocol v2 capability advertisement (upload-pack only). */
-function v2Advertisement(): Buffer {
-  return encodePktLines([
-    '# service=git-upload-pack\n',
-    'flush',
-    'version 2\n',
-    'ls-refs=unborn\n',
-    'fetch=shallow filter\n',
-    'flush',
-  ]);
-}
+/**
+ * The protocol v2 capability advertisement (upload-pack only). Static — the same
+ * lines for every repo — so it is one prebuilt buffer (perf round 2) instead of
+ * being re-encoded per advertisement.
+ */
+const V2_ADVERTISEMENT = encodePktLines([
+  '# service=git-upload-pack\n',
+  'flush',
+  'version 2\n',
+  'ls-refs=unborn\n',
+  'fetch=shallow filter\n',
+  'flush',
+]);
 
 /**
  * A v0 ref advertisement: the `# service=...` preamble, then one line per ref
@@ -248,7 +253,7 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
 function handleInfoRefs(req: IncomingMessage, res: ServerResponse, repo: Repo, url: ParsedRequestUrl): void {
   const service = url.searchParams.get('service');
   if (service === 'git-upload-pack') {
-    const body = wantsV2(req) ? v2Advertisement() : v0Advertisement(repo, 'git-upload-pack');
+    const body = wantsV2(req) ? V2_ADVERTISEMENT : v0Advertisement(repo, 'git-upload-pack');
     sendGit(res, 200, UPLOAD_ADVERTISEMENT, body);
     return;
   }
@@ -396,6 +401,29 @@ function parseFetchArgs(lines: readonly string[], v0: boolean): FetchArgs {
   return parsed;
 }
 
+/**
+ * The fetch-response cache key (perf round 2). A fetch response is a pure
+ * function of (protocol, request args, object store): the generation pins the
+ * store state (bumped on every object write, which also clears the cache), and
+ * the args are joined in their given order — haves order shapes the ACK
+ * section, shallow order shapes the shallow-info section, so they are NOT
+ * sorted. The bench's 50 concurrent clones send byte-identical fetch requests
+ * for the same tip, so every clone after the first is a cache hit.
+ */
+function fetchCacheKey(repo: Repo, fetch: FetchArgs, protocol: 'v2' | 'v0'): string {
+  return [
+    protocol,
+    repo.generation,
+    fetch.wants.join(','),
+    fetch.haves.join(','),
+    fetch.shallow.join(','),
+    fetch.depth ?? '',
+    fetch.deepenRelative === true ? '1' : '0',
+    fetch.filter ?? '',
+    fetch.done === true ? '1' : '0',
+  ].join('|');
+}
+
 function handleFetchV2(res: ServerResponse, repo: Repo, args: readonly string[]): void {
   const fetch = parseFetchArgs(args, false);
   for (const want of fetch.wants) {
@@ -403,6 +431,14 @@ function handleFetchV2(res: ServerResponse, repo: Repo, args: readonly string[])
       sendGit(res, 200, UPLOAD_RESULT, encodePktLines([`ERR object ${oneLine(want)} not found\n`, 'flush']));
       return;
     }
+  }
+  // The whole response is a pure function of (args, object store): a cached
+  // fetch for this exact key is byte-identical to a fresh build (perf round 2).
+  const cacheKey = fetchCacheKey(repo, fetch, 'v2');
+  const cached = getCachedFetch(repo, cacheKey);
+  if (cached !== undefined) {
+    sendGit(res, 200, UPLOAD_RESULT, cached);
+    return;
   }
   // An ACK means "the server has this object" (canonical upload-pack ACKs every
   // have it holds, whether or not it is an ancestor of a want). `ready` means a
@@ -429,7 +465,9 @@ function handleFetchV2(res: ServerResponse, repo: Repo, args: readonly string[])
       ack.push('NAK\n');
     }
     ack.push('flush');
-    sendGit(res, 200, UPLOAD_RESULT, encodePktLines(ack));
+    const body = encodePktLines(ack);
+    setCachedFetch(repo, cacheKey, body);
+    sendGit(res, 200, UPLOAD_RESULT, body);
     return;
   }
 
@@ -466,6 +504,7 @@ function handleFetchV2(res: ServerResponse, repo: Repo, args: readonly string[])
   }
   head.push('packfile\n');
   const body = Buffer.concat([encodePktLines(head), sidebandPackets(1, pack), pktFlush()]);
+  setCachedFetch(repo, cacheKey, body);
   sendGit(res, 200, UPLOAD_RESULT, body);
 }
 
@@ -482,6 +521,13 @@ function handleUploadPackV0(res: ServerResponse, repo: Repo, body: Buffer): void
       sendGit(res, 200, UPLOAD_RESULT, encodePktLines([`ERR object ${oneLine(want)} not found\n`, 'flush']));
       return;
     }
+  }
+  // Same pure-function argument as the v2 fetch (perf round 2).
+  const cacheKey = fetchCacheKey(repo, fetch, 'v0');
+  const cached = getCachedFetch(repo, cacheKey);
+  if (cached !== undefined) {
+    sendGit(res, 200, UPLOAD_RESULT, cached);
+    return;
   }
   const { objects, shallow, unshallow } = collectObjects(repo, fetch.wants, new Set(fetch.haves), {
     depth: fetch.depth,
@@ -502,6 +548,7 @@ function handleUploadPackV0(res: ServerResponse, repo: Repo, body: Buffer): void
     head.push('NAK\n');
   }
   const out = Buffer.concat([encodePktLines(head), sidebandPackets(1, pack), pktFlush()]);
+  setCachedFetch(repo, cacheKey, out);
   sendGit(res, 200, UPLOAD_RESULT, out);
 }
 
@@ -616,11 +663,17 @@ function handleReceivePack(res: ServerResponse, repo: Repo, body: Buffer): void 
     if (rest.length > 0) {
       try {
         const parsed = parsePack(rest, (oid) => getObject(repo, oid));
+        let storedNew = false;
         for (const object of parsed) {
           if (!repo.objects.has(object.oid)) {
             repo.objects.set(object.oid, { type: object.type, data: object.data });
+            storedNew = true;
           }
         }
+        // New objects change what a fetch can return: bump the generation so
+        // cached fetch bytes are dropped (perf round 2). A push that stores
+        // nothing new (all duplicates) leaves the cache untouched.
+        if (storedNew) bumpGeneration(repo);
       } catch (err) {
         unpackOk = false;
         unpackDetail = oneLine(err instanceof Error ? err.message : 'unpack failed');
