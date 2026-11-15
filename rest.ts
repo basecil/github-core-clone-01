@@ -53,9 +53,11 @@ import {
   createRepo,
   deleteRepo,
   findLabel,
+  getCachedIssueJson,
   getIssue,
   getPullRequest,
   getRepoByName,
+  invalidateIssueJson,
   isViewer,
   learnOwner,
   listRepos,
@@ -63,6 +65,7 @@ import {
   PLACEHOLDER_LOGIN,
   renameRepo,
   repoOwnerLogin,
+  setCachedIssueJson,
   tick,
   tickIso,
   touchRepo,
@@ -103,6 +106,28 @@ export function sendJson(res: ServerResponse, status: number, body: unknown, hea
   res.writeHead(status, {
     'content-type': JSON_TYPE,
     'content-length': Buffer.byteLength(text),
+    'x-github-request-id': nextRequestId(),
+    ...headers,
+  });
+  res.end(text);
+}
+
+/**
+ * Answer with a pre-built JSON body (perf round 2): `text` already carries the
+ * trailing '\n' sendJson appends. `length` is the body's byte length when the
+ * caller knows it (the issue cache precomputes it); otherwise it is measured.
+ * Byte-identical to sendJson for the same logical body.
+ */
+export function sendPrebuiltJson(
+  res: ServerResponse,
+  status: number,
+  text: string,
+  headers: Readonly<Record<string, string>> = {},
+  length?: number,
+): void {
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': length ?? Buffer.byteLength(text),
     'x-github-request-id': nextRequestId(),
     ...headers,
   });
@@ -391,6 +416,40 @@ function issueJson(issue: Issue, repo: Repo, origin: string): JsonObject {
     html_url: `${origin}/${owner}/${repo.name}/issues/${issue.number}`,
     comments_url: `${base}/comments`,
   };
+}
+
+/**
+ * Answer a single-issue GET/CREATE/PATCH with the issue's cached REST body
+ * (perf round 2): a cache hit sends the pre-built string with no object build
+ * and no stringify; a miss builds, caches and sends exactly what sendJson
+ * would have. The cache is validated on (origin, owner, repo name) at read
+ * time and invalidated at every issue-mutation site, so a hit is always the
+ * body a fresh build would produce.
+ */
+function sendIssueJson(res: ServerResponse, status: number, issue: Issue, repo: Repo, origin: string): void {
+  const owner = repoOwnerLogin(repo);
+  const cached = getCachedIssueJson(repo, issue.number, origin, owner, repo.name);
+  if (cached !== undefined) {
+    sendPrebuiltJson(res, status, cached.text, {}, cached.length);
+    return;
+  }
+  const text = `${JSON.stringify(issueJson(issue, repo, origin))}\n`;
+  setCachedIssueJson(repo, issue.number, origin, owner, repo.name, text);
+  sendPrebuiltJson(res, status, text);
+}
+
+/**
+ * One issue's REST JSON as a string, without the trailing newline (perf round
+ * 2): the list endpoints join these with ',' inside '[' ']' — byte-identical
+ * to JSON.stringify of the array of issue objects (no spaces either way).
+ */
+function issueJsonText(issue: Issue, repo: Repo, origin: string): string {
+  const owner = repoOwnerLogin(repo);
+  const cached = getCachedIssueJson(repo, issue.number, origin, owner, repo.name);
+  if (cached !== undefined) return cached.text.slice(0, -1);
+  const text = `${JSON.stringify(issueJson(issue, repo, origin))}\n`;
+  setCachedIssueJson(repo, issue.number, origin, owner, repo.name, text);
+  return text.slice(0, -1);
 }
 
 function commentJson(comment: IssueComment, repo: Repo, issueNumber: number, origin: string): JsonObject {
@@ -968,7 +1027,7 @@ async function handleIssues(
         return;
       }
       const issue = createIssue(repo, { title, body: asString(body.body) ?? '', labels });
-      sendJson(res, 201, issueJson(issue, repo, origin));
+      sendIssueJson(res, 201, issue, repo, origin);
       return;
     }
     if (method === 'GET') {
@@ -982,7 +1041,9 @@ async function handleIssues(
       const params = pageParams(url);
       const { page, totalPages } = paginate(list, params);
       const link = linkHeader(req, url, params, totalPages);
-      sendJson(res, 200, page.map((issue) => issueJson(issue, repo, origin)), link === null ? {} : { link });
+      // The joined body is byte-identical to JSON.stringify of the issue array.
+      const bodyText = `[${page.map((issue) => issueJsonText(issue, repo, origin)).join(',')}]\n`;
+      sendPrebuiltJson(res, 200, bodyText, link === null ? {} : { link });
       return;
     }
     return sendNotFound(res);
@@ -996,7 +1057,7 @@ async function handleIssues(
 
   if (tail.length === 1) {
     if (method === 'GET') {
-      sendJson(res, 200, issueJson(issue, repo, origin));
+      sendIssueJson(res, 200, issue, repo, origin);
       return;
     }
     if (method === 'PATCH') {
@@ -1023,7 +1084,9 @@ async function handleIssues(
         issue.closed_at = state === 'closed' ? tickIso() : null;
       }
       issue.updated_at = tickIso();
-      sendJson(res, 200, issueJson(issue, repo, origin));
+      // The mutation changed the body: drop the cached one BEFORE rebuilding it.
+      invalidateIssueJson(repo, issue.number);
+      sendIssueJson(res, 200, issue, repo, origin);
       return;
     }
     return sendNotFound(res);
@@ -1039,6 +1102,8 @@ async function handleIssues(
       }
       const comment = createComment(issue, commentBody);
       issue.updated_at = tickIso();
+      // The comment count and updated_at changed: drop the cached issue body.
+      invalidateIssueJson(repo, issue.number);
       sendJson(res, 201, commentJson(comment, repo, issue.number, origin));
       return;
     }

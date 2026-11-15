@@ -27,6 +27,7 @@ import {
   getIssue,
   getPullRequest,
   getRepoByName,
+  invalidateIssueJson,
   isViewer,
   learnOwner,
   listRepos,
@@ -1377,6 +1378,7 @@ const RESOLVERS: Readonly<Record<string, Readonly<Record<string, Resolver>>>> = 
         issue.closed_at = tickIso();
       }
       issue.updated_at = tickIso();
+      invalidateIssueJson(repo, issue.number); // the REST body changed: drop the cached one
       return {
         __typename: 'CloseIssuePayload',
         issue: issueObject(repo, issue),
@@ -1428,6 +1430,7 @@ const RESOLVERS: Readonly<Record<string, Readonly<Record<string, Resolver>>>> = 
       if (typeof body !== 'string' || body === '') throw new GqlError('Body is required.');
       const comment = createComment(issue, body);
       issue.updated_at = tickIso();
+      invalidateIssueJson(repo, issue.number); // comment count + updated_at changed
       return {
         __typename: 'AddCommentPayload',
         commentEdge: {

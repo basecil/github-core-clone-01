@@ -76,6 +76,14 @@
 //                              unknown); input { title, body, headRef, baseRef };
 //                              head/base sha are the branch tips at creation time
 //   getPullRequest(repo, number) — PullRequest | undefined
+//
+// Perf round 2 (caches; all behaviour-preserving, validated or invalidated so a
+// stale entry can only miss, never serve wrong bytes):
+//   getCachedIssueJson(repo, number, origin, owner, repoName) — cached REST body
+//   setCachedIssueJson(repo, number, origin, owner, repoName, text)
+//   invalidateIssueJson(repo, number?) — one issue, or the whole repo's cache
+//   bumpGeneration(repo)         — object-store write: generation += 1, fetch cache cleared
+//   getCachedFetch(repo, key) / setCachedFetch(repo, key, body) — fetch responses
 
 import type { IncomingMessage } from 'node:http';
 import type { ParsedCommit, TreeEntry } from './git-object.ts';
@@ -160,6 +168,9 @@ export function nextRequestId(): string {
 /** The shop token, read once at startup. Never printed, never logged. */
 const SHOP_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 
+/** The exact Authorization header value a request must carry (precomputed once). */
+const EXPECTED_AUTH_HEADER = SHOP_TOKEN === '' ? '' : `Bearer ${SHOP_TOKEN}`;
+
 export function shopTokenConfigured(): boolean {
   return SHOP_TOKEN !== '';
 }
@@ -167,8 +178,7 @@ export function shopTokenConfigured(): boolean {
 /** True iff the request carries `Authorization: Bearer <MAKEFUN_SHOP_TOKEN>` exactly. */
 export function checkAuth(req: IncomingMessage): boolean {
   if (SHOP_TOKEN === '') return false;
-  const header = req.headers.authorization;
-  return header === `Bearer ${SHOP_TOKEN}`;
+  return req.headers.authorization === EXPECTED_AUTH_HEADER;
 }
 
 // ── Data model ──────────────────────────────────────────────────────────────────
@@ -209,6 +219,31 @@ export interface Issue {
   closed_at: string | null;
   comments: IssueComment[];
 }
+
+/**
+ * One cached REST JSON body for an issue (perf round 2): the exact string
+ * `JSON.stringify(issueJson(issue, repo, origin))` plus the trailing newline
+ * sendJson appends, with the values it depends on. The body is a pure function
+ * of (issue fields, repo owner, repo name, origin): origin/owner/repoName are
+ * validated on every read, so owner learning, repo renames and Host changes
+ * can only cause a miss and a rebuild, never a stale hit. Issue-field changes
+ * invalidate explicitly at the mutation sites (PATCH, comment create, GraphQL
+ * closeIssue/addComment); label upserts clear the whole repo's cache (labels
+ * are embedded in the body). Bounded: at most ISSUE_JSON_CACHE_MAX entries
+ * per repo, oldest evicted first (Map insertion order).
+ */
+export interface CachedIssueJson {
+  origin: string;
+  owner: string;
+  repoName: string;
+  /** The full response body, trailing '\n' included. */
+  text: string;
+  /** Buffer.byteLength(text) — computed once, at cache time. */
+  length: number;
+}
+
+/** Max cached issue bodies per repo (perf round 2; the bench holds ≤ 605). */
+export const ISSUE_JSON_CACHE_MAX = 4096;
 
 export interface PullRequest {
   number: number;
@@ -259,7 +294,32 @@ export interface Repo {
   parsedTrees: Map<string, TreeEntry[]>;
   /** Memoised zlib streams per object (git-pack.ts buildPack): same immutability argument. */
   deflatedObjects: Map<string, Buffer>;
+  /**
+   * Cached REST JSON bodies for issues, by issue number (perf round 2; see
+   * CachedIssueJson). Invalidated on issue mutation; validated on owner/name/
+   * origin at read time.
+   */
+  issueJsonCache: Map<number, CachedIssueJson>;
+  /**
+   * Object-store generation (perf round 2): bumped on every object write
+   * (putObject, receive-pack unpack). The fetch-response cache keys on it, so
+   * any store change invalidates cached fetch bytes.
+   */
+  generation: number;
+  /**
+   * Cached git fetch responses, by fetch signature (perf round 2): the exact
+   * bytes handleFetchV2/handleUploadPackV0 would build for (wants, haves,
+   * shallow, depth, deepenRelative, filter, done, generation). Cleared on
+   * generation bump; bounded by FETCH_CACHE_MAX_ENTRIES / FETCH_CACHE_MAX_BYTES.
+   */
+  fetchCache: Map<string, Buffer>;
+  /** Total bytes held in fetchCache (for the cap). */
+  fetchCacheBytes: number;
 }
+
+/** Fetch-cache caps per repo (perf round 2). */
+export const FETCH_CACHE_MAX_ENTRIES = 16;
+export const FETCH_CACHE_MAX_BYTES = 8 * 1024 * 1024;
 
 // ── Global counters + registries ────────────────────────────────────────────────
 
@@ -300,12 +360,15 @@ export function findLabel(repo: Repo, name: string): Label | undefined {
 /**
  * Create a label, or update the existing one with that name (the checks POST a default
  * label name through /labels and expect 201, so upsert — never a duplicate error).
+ * An update mutates the shared Label record, which is embedded in cached issue JSON
+ * bodies, so the repo's issue cache is cleared (perf round 2).
  */
 export function createOrUpdateLabel(repo: Repo, name: string, color?: string, description?: string): Label {
   const existing = findLabel(repo, name);
   if (existing !== undefined) {
     if (color !== undefined && color !== '') existing.color = color;
     if (description !== undefined) existing.description = description;
+    invalidateIssueJson(repo);
     return existing;
   }
   const label: Label = {
@@ -345,6 +408,10 @@ export function createRepo(input: { name: string; private: boolean; description:
     parsedCommits: new Map(),
     parsedTrees: new Map(),
     deflatedObjects: new Map(),
+    issueJsonCache: new Map(),
+    generation: 0,
+    fetchCache: new Map(),
+    fetchCacheBytes: 0,
   };
   reposByName.set(repo.name, repo);
   reposInOrder.push(repo);
@@ -455,4 +522,97 @@ export function createPullRequest(
 
 export function getPullRequest(repo: Repo, number: number): PullRequest | undefined {
   return repo.pullsByNumber.get(number);
+}
+
+// ── Perf round 2: issue JSON cache ────────────────────────────────────────────
+
+/**
+ * The cached REST body for one issue, or undefined on a miss or a stale entry.
+ * `owner` is the repo's current owner login (repoOwnerLogin) and `repoName` the
+ * repo's current name: entries recorded under other values are stale (owner
+ * learning, repo rename) and miss, so they can never serve wrong URLs.
+ */
+export function getCachedIssueJson(
+  repo: Repo,
+  number: number,
+  origin: string,
+  owner: string,
+  repoName: string,
+): CachedIssueJson | undefined {
+  const cached = repo.issueJsonCache.get(number);
+  if (cached === undefined) return undefined;
+  if (cached.origin !== origin || cached.owner !== owner || cached.repoName !== repoName) return undefined;
+  return cached;
+}
+
+/** Record a freshly built issue body (text already includes the trailing '\n'). */
+export function setCachedIssueJson(
+  repo: Repo,
+  number: number,
+  origin: string,
+  owner: string,
+  repoName: string,
+  text: string,
+): void {
+  const cache = repo.issueJsonCache;
+  if (!cache.has(number)) {
+    while (cache.size >= ISSUE_JSON_CACHE_MAX) {
+      const oldest = cache.keys().next().value as number | undefined;
+      if (oldest === undefined) break;
+      cache.delete(oldest);
+    }
+  }
+  cache.set(number, { origin, owner, repoName, text, length: Buffer.byteLength(text) });
+}
+
+/**
+ * Drop cached issue bodies: one issue (`number` given — PATCH, comment create,
+ * GraphQL closeIssue/addComment) or the whole repo (label upsert, which mutates
+ * the Label records embedded in every issue body).
+ */
+export function invalidateIssueJson(repo: Repo, number?: number): void {
+  if (number === undefined) repo.issueJsonCache.clear();
+  else repo.issueJsonCache.delete(number);
+}
+
+// ── Perf round 2: object-store generation + fetch cache ───────────────────────
+
+/**
+ * Bump the repo's object-store generation and drop its cached fetch responses.
+ * Called on every object write (putObject, receive-pack unpack): a fetch's
+ * bytes are a pure function of (request args, object store), so any store
+ * change invalidates every cached fetch. Ref-only changes do not affect fetch
+ * bytes (fetch takes explicit wants), so they need no bump.
+ */
+export function bumpGeneration(repo: Repo): void {
+  repo.generation += 1;
+  repo.fetchCache.clear();
+  repo.fetchCacheBytes = 0;
+}
+
+/** A cached fetch response for `key` (already generation-scoped by the caller). */
+export function getCachedFetch(repo: Repo, key: string): Buffer | undefined {
+  return repo.fetchCache.get(key);
+}
+
+/** Record a fetch response, evicting oldest entries while over either cap. */
+export function setCachedFetch(repo: Repo, key: string, body: Buffer): void {
+  if (body.length > FETCH_CACHE_MAX_BYTES) return; // a single giant fetch is never cached
+  const existing = repo.fetchCache.get(key);
+  if (existing !== undefined) repo.fetchCacheBytes -= existing.length;
+  else {
+    while (
+      (repo.fetchCache.size >= FETCH_CACHE_MAX_ENTRIES ||
+        repo.fetchCacheBytes + body.length > FETCH_CACHE_MAX_BYTES) &&
+      repo.fetchCache.size > 0
+    ) {
+      const oldest = repo.fetchCache.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      const dropped = repo.fetchCache.get(oldest);
+      if (dropped !== undefined) repo.fetchCacheBytes -= dropped.length;
+      repo.fetchCache.delete(oldest);
+    }
+  }
+  repo.fetchCache.set(key, body);
+  repo.fetchCacheBytes += body.length;
 }

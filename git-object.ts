@@ -36,6 +36,7 @@
 //   commitAuthorOf(repo, commitOid)      — { name, email, date } for REST responses
 
 import { createHash } from 'node:crypto';
+import { bumpGeneration } from './store.ts';
 import type { GitObject, ObjectType, Repo } from './store.ts';
 
 export interface TreeEntry {
@@ -74,7 +75,13 @@ export function objectId(type: ObjectType, data: Buffer): string {
 /** Store an object (idempotent — same bytes, same oid) and return its oid. */
 export function putObject(repo: Repo, type: ObjectType, data: Buffer): string {
   const oid = objectId(type, data);
-  if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+  if (!repo.objects.has(oid)) {
+    repo.objects.set(oid, { type, data });
+    // A new object changes what a fetch can return: bump the generation so
+    // cached fetch bytes are dropped (perf round 2). A no-op put (object
+    // already present) leaves the store — and the cache — untouched.
+    bumpGeneration(repo);
+  }
   return oid;
 }
 
