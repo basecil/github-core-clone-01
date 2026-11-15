@@ -565,8 +565,8 @@ function fileEntryJson(
 // ── The REST dispatcher ───────────────────────────────────────────────────────
 
 /** Handle one /api/v3/* request. Always answers (never throws to the caller). */
-export async function handleRest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const url = parseRequestUrl(req);
+export async function handleRest(req: IncomingMessage, res: ServerResponse, parsedUrl?: ParsedRequestUrl): Promise<void> {
+  const url = parsedUrl ?? parseRequestUrl(req);
   const method = (req.method ?? 'GET').toUpperCase();
   const origin = originOf(req);
 

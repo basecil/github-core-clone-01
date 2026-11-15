@@ -133,8 +133,8 @@ function wantsV2(req: IncomingMessage): boolean {
 // ── The mount handler ─────────────────────────────────────────────────────────
 
 /** Handle one /{owner}/{repo}.git/* request. Always answers (never throws to the caller). */
-export async function handleGit(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const url = parseRequestUrl(req);
+export async function handleGit(req: IncomingMessage, res: ServerResponse, parsedUrl?: ParsedRequestUrl): Promise<void> {
+  const url = parsedUrl ?? parseRequestUrl(req);
   const method = (req.method ?? 'GET').toUpperCase();
 
   try {

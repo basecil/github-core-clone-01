@@ -17,9 +17,21 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { handleGit } from './git-http.ts';
 import { handleGraphQL } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
-import { handleRest, parseRequestUrl, sendError, sendJson, sendNotFound } from './rest.ts';
+import {
+  handleRest,
+  parseRequestUrl,
+  sendError,
+  sendJson,
+  sendNotFound,
+  type ParsedRequestUrl,
+} from './rest.ts';
 
-type Handler = (req: IncomingMessage, res: ServerResponse) => Promise<void> | void;
+/**
+ * A mount handler. The router parses the request URL once and hands the parsed
+ * form to the handler (perf round 2: rest.ts and git-http.ts used to re-parse
+ * it); a handler that does not need the URL ignores the third argument.
+ */
+type Handler = (req: IncomingMessage, res: ServerResponse, url?: ParsedRequestUrl) => Promise<void> | void;
 
 interface Mount {
   /** Human name for the mount (logs/diagnostics only). */
@@ -44,15 +56,13 @@ const mounts: readonly Mount[] = [
   },
 ];
 
-/** The path of a request URL, or '/' when it does not parse (never a throw). */
-function pathOf(req: IncomingMessage): string {
-  return parseRequestUrl(req).pathname;
-}
-
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-    const path = pathOf(req);
+    // The URL is parsed ONCE here; the parsed form is passed to the mount
+    // handler so no request pays for a second parse (perf round 2).
+    const url = parseRequestUrl(req);
+    const path = url.pathname;
     const method = req.method ?? 'GET';
 
     // The env's boot check calls this twice: 200 {"ok":true}, no auth.
@@ -64,7 +74,7 @@ export function createApp(): Server {
     for (const mount of mounts) {
       if (!mount.test(path)) continue;
       Promise.resolve()
-        .then(() => mount.handler(req, res))
+        .then(() => mount.handler(req, res, url))
         .catch(() => {
           // A handler bug must never take the server down or hang the client.
           if (!res.headersSent) sendError(res, 500, 'Internal Server Error');
