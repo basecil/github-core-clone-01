@@ -134,6 +134,28 @@ export function sendPrebuiltJson(
   res.end(text);
 }
 
+/**
+ * Answer with a pre-built JSON body held as a Buffer (perf round 3): identical
+ * bytes to sendPrebuiltJson for the same body, but no per-response UTF-8
+ * encode — res.end(Buffer) sends the bytes as-is. The body must already carry
+ * the trailing '\n' sendJson appends.
+ */
+export function sendPrebuiltBuffer(
+  res: ServerResponse,
+  status: number,
+  body: Buffer,
+  headers: Readonly<Record<string, string>> = {},
+  length?: number,
+): void {
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': length ?? body.length,
+    'x-github-request-id': nextRequestId(),
+    ...headers,
+  });
+  res.end(body);
+}
+
 /** Answer with no body (204); still carries X-GitHub-Request-Id. */
 export function sendEmpty(res: ServerResponse, status: number, headers: Readonly<Record<string, string>> = {}): void {
   res.writeHead(status, { 'x-github-request-id': nextRequestId(), ...headers });
@@ -420,22 +442,22 @@ function issueJson(issue: Issue, repo: Repo, origin: string): JsonObject {
 
 /**
  * Answer a single-issue GET/CREATE/PATCH with the issue's cached REST body
- * (perf round 2): a cache hit sends the pre-built string with no object build
- * and no stringify; a miss builds, caches and sends exactly what sendJson
- * would have. The cache is validated on (origin, owner, repo name) at read
- * time and invalidated at every issue-mutation site, so a hit is always the
- * body a fresh build would produce.
+ * (perf round 2): a cache hit sends the pre-built Buffer with no object build,
+ * no stringify and no UTF-8 encode; a miss builds, caches and sends exactly
+ * what sendJson would have. The cache is validated on (origin, owner, repo
+ * name) at read time and invalidated at every issue-mutation site, so a hit
+ * is always the body a fresh build would produce.
  */
 function sendIssueJson(res: ServerResponse, status: number, issue: Issue, repo: Repo, origin: string): void {
   const owner = repoOwnerLogin(repo);
   const cached = getCachedIssueJson(repo, issue.number, origin, owner, repo.name);
   if (cached !== undefined) {
-    sendPrebuiltJson(res, status, cached.text, {}, cached.length);
+    sendPrebuiltBuffer(res, status, cached.body, {}, cached.length);
     return;
   }
   const text = `${JSON.stringify(issueJson(issue, repo, origin))}\n`;
-  setCachedIssueJson(repo, issue.number, origin, owner, repo.name, text);
-  sendPrebuiltJson(res, status, text);
+  const entry = setCachedIssueJson(repo, issue.number, origin, owner, repo.name, text);
+  sendPrebuiltBuffer(res, status, entry.body, {}, entry.length);
 }
 
 /**

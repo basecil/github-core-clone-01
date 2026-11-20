@@ -238,7 +238,14 @@ export interface CachedIssueJson {
   repoName: string;
   /** The full response body, trailing '\n' included. */
   text: string;
-  /** Buffer.byteLength(text) — computed once, at cache time. */
+  /**
+   * The same body pre-encoded once, at cache time (perf round 3): sending a
+   * Buffer skips the per-response UTF-8 encode res.end(string) performs
+   * (writeUtf8String was ~20% of read-workload CPU in the round-3 profile).
+   * The string stays for the list endpoints, which join issue bodies.
+   */
+  body: Buffer;
+  /** body.length — computed once, at cache time. */
   length: number;
 }
 
@@ -545,7 +552,7 @@ export function getCachedIssueJson(
   return cached;
 }
 
-/** Record a freshly built issue body (text already includes the trailing '\n'). */
+/** Record a freshly built issue body (text already includes the trailing '\n'). Returns the stored entry. */
 export function setCachedIssueJson(
   repo: Repo,
   number: number,
@@ -553,7 +560,7 @@ export function setCachedIssueJson(
   owner: string,
   repoName: string,
   text: string,
-): void {
+): CachedIssueJson {
   const cache = repo.issueJsonCache;
   if (!cache.has(number)) {
     while (cache.size >= ISSUE_JSON_CACHE_MAX) {
@@ -562,7 +569,10 @@ export function setCachedIssueJson(
       cache.delete(oldest);
     }
   }
-  cache.set(number, { origin, owner, repoName, text, length: Buffer.byteLength(text) });
+  const body = Buffer.from(text);
+  const entry: CachedIssueJson = { origin, owner, repoName, text, body, length: body.length };
+  cache.set(number, entry);
+  return entry;
 }
 
 /**
