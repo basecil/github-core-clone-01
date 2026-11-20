@@ -19,7 +19,7 @@
 // are base64url of `cursor:<index>` in the ordered list. No randomness, no
 // wall clock anywhere: timestamps come from the store's logical clock.
 
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { ForgeRequest, ForgeResponse } from './forge-http.ts';
 import {
   checkAuth,
   createComment,
@@ -59,7 +59,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /** Read the request body (≤10 MB) and parse it as JSON (object or array). */
-async function readBodyJson(req: IncomingMessage): Promise<unknown> {
+async function readBodyJson(req: ForgeRequest): Promise<unknown> {
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const chunk of req) {
@@ -78,7 +78,7 @@ async function readBodyJson(req: IncomingMessage): Promise<unknown> {
 }
 
 /** Handle POST /api/graphql (mounted by app.ts). Always answers, never throws. */
-export async function handleGraphQL(req: IncomingMessage, res: ServerResponse): Promise<void> {
+export async function handleGraphQL(req: ForgeRequest, res: ForgeResponse): Promise<void> {
   try {
     if ((req.method ?? 'GET').toUpperCase() !== 'POST') {
       sendNotFound(res);

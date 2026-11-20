@@ -13,10 +13,12 @@
 // Every reply is JSON and carries X-GitHub-Request-Id (see rest.ts sendJson).
 // A handler that throws answers 500 JSON; the server stays up.
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import type { Server } from 'node:net';
+import type { ForgeRequest, ForgeResponse } from './forge-http.ts';
 import { handleGit } from './git-http.ts';
 import { handleGraphQL } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
+import { createRawServer } from './raw-http.ts';
 import {
   handleRest,
   parseRequestUrl,
@@ -31,7 +33,7 @@ import {
  * form to the handler (perf round 2: rest.ts and git-http.ts used to re-parse
  * it); a handler that does not need the URL ignores the third argument.
  */
-type Handler = (req: IncomingMessage, res: ServerResponse, url?: ParsedRequestUrl) => Promise<void> | void;
+type Handler = (req: ForgeRequest, res: ForgeResponse, url?: ParsedRequestUrl) => Promise<void> | void;
 
 interface Mount {
   /** Human name for the mount (logs/diagnostics only). */
@@ -56,9 +58,17 @@ const mounts: readonly Mount[] = [
   },
 ];
 
-/** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
+/**
+ * Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port.
+ *
+ * Transport (perf round 3): a hand-rolled HTTP/1.1 server over node:net
+ * (raw-http.ts) instead of node:http — the same dispatch, the same handlers,
+ * ~14µs less per exchange in the transport experiment. Malformed requests
+ * are answered 400 + close inside the transport (what node:http's
+ * clientError handler did).
+ */
 export function createApp(): Server {
-  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+  const server = createRawServer((req: ForgeRequest, res: ForgeResponse) => {
     // The URL is parsed ONCE here; the parsed form is passed to the mount
     // handler so no request pays for a second parse (perf round 2).
     const url = parseRequestUrl(req);
@@ -94,15 +104,6 @@ export function createApp(): Server {
 
     // Everything else, every method: GitHub's 404 body.
     sendNotFound(res);
-  });
-
-  // A malformed HTTP request line still gets a JSON answer, not a bare socket close.
-  server.on('clientError', (err: Error, socket) => {
-    const body = `${JSON.stringify({ message: 'Bad Request' })}\n`;
-    socket.end(
-      `HTTP/1.1 400 Bad Request\r\ncontent-type: application/json; charset=utf-8\r\ncontent-length: ${Buffer.byteLength(body)}\r\nconnection: close\r\n\r\n${body}`,
-    );
-    void err;
   });
 
   return server;

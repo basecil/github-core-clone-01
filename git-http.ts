@@ -37,7 +37,7 @@
 // ── API surface ────────────────────────────────────────────────────────────────
 //   handleGit(req, res) — the mount handler (async; always answers, never throws)
 
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { ForgeRequest, ForgeResponse } from './forge-http.ts';
 import {
   bumpGeneration,
   checkAuth,
@@ -79,7 +79,7 @@ function oneLine(value: string): string {
  * machinery (createAsyncIterator) showed up in the push profile, and the
  * listener form allocates nothing per chunk beyond the chunk itself.
  */
-async function readBody(req: IncomingMessage): Promise<Buffer> {
+async function readBody(req: ForgeRequest): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let total = 0;
   return new Promise<Buffer>((resolve, reject) => {
@@ -108,7 +108,7 @@ async function readBody(req: IncomingMessage): Promise<Buffer> {
 }
 
 /** Answer with a git content type; still carries X-GitHub-Request-Id like every reply. */
-function sendGit(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
+function sendGit(res: ForgeResponse, status: number, contentType: string, body: Buffer): void {
   res.writeHead(status, {
     'content-type': contentType,
     'content-length': body.length,
@@ -147,14 +147,14 @@ function parseGitPath(pathname: string): GitRoute | null {
 }
 
 /** The request asks for protocol v2 when it carries `Git-Protocol: version=2`. */
-function wantsV2(req: IncomingMessage): boolean {
+function wantsV2(req: ForgeRequest): boolean {
   return (req.headers['git-protocol'] ?? '') === 'version=2';
 }
 
 // ── The mount handler ─────────────────────────────────────────────────────────
 
 /** Handle one /{owner}/{repo}.git/* request. Always answers (never throws to the caller). */
-export async function handleGit(req: IncomingMessage, res: ServerResponse, parsedUrl?: ParsedRequestUrl): Promise<void> {
+export async function handleGit(req: ForgeRequest, res: ForgeResponse, parsedUrl?: ParsedRequestUrl): Promise<void> {
   const url = parsedUrl ?? parseRequestUrl(req);
   const method = (req.method ?? 'GET').toUpperCase();
 
@@ -271,7 +271,7 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
   return encodePktLines([`# service=${service}\n`, 'flush', ...lines, 'flush']);
 }
 
-function handleInfoRefs(req: IncomingMessage, res: ServerResponse, repo: Repo, url: ParsedRequestUrl): void {
+function handleInfoRefs(req: ForgeRequest, res: ForgeResponse, repo: Repo, url: ParsedRequestUrl): void {
   const service = url.searchParams.get('service');
   if (service === 'git-upload-pack') {
     const body = wantsV2(req) ? V2_ADVERTISEMENT : v0Advertisement(repo, 'git-upload-pack');
@@ -287,7 +287,7 @@ function handleInfoRefs(req: IncomingMessage, res: ServerResponse, repo: Repo, u
 
 // ── Upload-pack ───────────────────────────────────────────────────────────────
 
-function handleUploadPack(req: IncomingMessage, res: ServerResponse, repo: Repo, body: Buffer): void {
+function handleUploadPack(req: ForgeRequest, res: ForgeResponse, repo: Repo, body: Buffer): void {
   try {
     if (wantsV2(req)) handleUploadPackV2(res, repo, body);
     else handleUploadPackV0(res, repo, body);
@@ -320,7 +320,7 @@ function commonHaves(repo: Repo, wants: readonly string[], haves: readonly strin
   return common;
 }
 
-function handleUploadPackV2(res: ServerResponse, repo: Repo, body: Buffer): void {
+function handleUploadPackV2(res: ForgeResponse, repo: Repo, body: Buffer): void {
   const { packets, rest } = decodePktLinesAll(body);
   if (rest.length !== 0) throw new Error('trailing bytes after the pkt-line stream');
   const first = packets[0];
@@ -351,7 +351,7 @@ function handleUploadPackV2(res: ServerResponse, repo: Repo, body: Buffer): void
   sendGit(res, 200, UPLOAD_RESULT, encodePktLines([`ERR unknown command ${oneLine(command)}\n`, 'flush']));
 }
 
-function handleLsRefs(res: ServerResponse, repo: Repo, args: readonly string[]): void {
+function handleLsRefs(res: ForgeResponse, repo: Repo, args: readonly string[]): void {
   const peel = args.includes('peel');
   const symrefs = args.includes('symrefs');
   const unborn = args.includes('unborn');
@@ -445,7 +445,7 @@ function fetchCacheKey(repo: Repo, fetch: FetchArgs, protocol: 'v2' | 'v0'): str
   ].join('|');
 }
 
-function handleFetchV2(res: ServerResponse, repo: Repo, args: readonly string[]): void {
+function handleFetchV2(res: ForgeResponse, repo: Repo, args: readonly string[]): void {
   const fetch = parseFetchArgs(args, false);
   for (const want of fetch.wants) {
     if (getObject(repo, want) === undefined) {
@@ -529,7 +529,7 @@ function handleFetchV2(res: ServerResponse, repo: Repo, args: readonly string[])
   sendGit(res, 200, UPLOAD_RESULT, body);
 }
 
-function handleUploadPackV0(res: ServerResponse, repo: Repo, body: Buffer): void {
+function handleUploadPackV0(res: ForgeResponse, repo: Repo, body: Buffer): void {
   const { packets, rest } = decodePktLinesAll(body);
   if (rest.length !== 0) throw new Error('trailing bytes after the pkt-line stream');
   const lines: string[] = [];
@@ -641,7 +641,7 @@ function applyPushCommand(repo: Repo, command: PushCommand): RefReport {
   return { ref: command.ref, ok: true, reason: '' };
 }
 
-function handleReceivePack(res: ServerResponse, repo: Repo, body: Buffer): void {
+function handleReceivePack(res: ForgeResponse, repo: Repo, body: Buffer): void {
   try {
     const { packets, rest } = decodePktLinesAll(body, { stopAtFlush: true });
     const last = packets[packets.length - 1];

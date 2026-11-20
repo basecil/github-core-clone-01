@@ -54,7 +54,7 @@
 // from the store's logical clock, and tools/list is a frozen constant, so two
 // calls answer byte-identically.
 
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { ForgeRequest, ForgeResponse } from './forge-http.ts';
 import {
   checkAuth,
   createIssue,
@@ -227,7 +227,7 @@ function pickString(args: JsonObject, names: readonly string[]): string | undefi
 }
 
 /** The request's own origin (scheme + Host header) for absolute URL fields. */
-function originOf(req: IncomingMessage): string {
+function originOf(req: ForgeRequest): string {
   const host = req.headers.host ?? '127.0.0.1';
   return `http://${host}`;
 }
@@ -241,12 +241,12 @@ function branchOf(ref: string): string {
 // ── Response helpers ──────────────────────────────────────────────────────────
 
 /** A JSON-RPC success: HTTP 200, the request's id echoed verbatim. */
-function sendResult(res: ServerResponse, id: JsonRpcId, result: unknown): void {
+function sendResult(res: ForgeResponse, id: JsonRpcId, result: unknown): void {
   sendJson(res, 200, { jsonrpc: '2.0', id, result });
 }
 
 /** A JSON-RPC error: HTTP 200 (except parse errors, which are HTTP 400). */
-function sendRpcError(res: ServerResponse, status: number, id: JsonRpcId, code: number, message: string): void {
+function sendRpcError(res: ForgeResponse, status: number, id: JsonRpcId, code: number, message: string): void {
   sendJson(res, status, { jsonrpc: '2.0', id, error: { code, message } });
 }
 
@@ -493,7 +493,7 @@ const TOOL_HANDLERS: Readonly<Record<string, (args: JsonObject, origin: string) 
 class MalformedBodyError extends Error {}
 
 /** Read the request body (≤10 MB) as text. */
-async function readBody(req: IncomingMessage): Promise<string> {
+async function readBody(req: ForgeRequest): Promise<string> {
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const chunk of req) {
@@ -508,7 +508,7 @@ async function readBody(req: IncomingMessage): Promise<string> {
 // ── The handler ───────────────────────────────────────────────────────────────
 
 /** Handle /mcp: POST only, JSON-RPC 2.0 over streamable HTTP. Always answers. */
-export async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<void> {
+export async function handleMcp(req: ForgeRequest, res: ForgeResponse): Promise<void> {
   const method = (req.method ?? 'GET').toUpperCase();
   const origin = originOf(req);
 

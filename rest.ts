@@ -42,7 +42,7 @@
 //   * Unknown route or wrong method → 404 {"message": "Not Found"} (GitHub's answer).
 //   * Missing/wrong token → 401 on every route here (GET /healthz is app.ts's, unauthenticated).
 
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { ForgeRequest, ForgeResponse } from './forge-http.ts';
 import {
   authorIdentity,
   checkAuth,
@@ -101,7 +101,7 @@ type JsonObject = Record<string, unknown>;
 // ── Response helpers (shared with app.ts) ─────────────────────────────────────
 
 /** Answer with a JSON body; always sets Content-Type and X-GitHub-Request-Id. */
-export function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
+export function sendJson(res: ForgeResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
   const text = `${JSON.stringify(body)}\n`;
   res.writeHead(status, {
     'content-type': JSON_TYPE,
@@ -119,7 +119,7 @@ export function sendJson(res: ServerResponse, status: number, body: unknown, hea
  * Byte-identical to sendJson for the same logical body.
  */
 export function sendPrebuiltJson(
-  res: ServerResponse,
+  res: ForgeResponse,
   status: number,
   text: string,
   headers: Readonly<Record<string, string>> = {},
@@ -141,7 +141,7 @@ export function sendPrebuiltJson(
  * the trailing '\n' sendJson appends.
  */
 export function sendPrebuiltBuffer(
-  res: ServerResponse,
+  res: ForgeResponse,
   status: number,
   body: Buffer,
   headers: Readonly<Record<string, string>> = {},
@@ -157,25 +157,25 @@ export function sendPrebuiltBuffer(
 }
 
 /** Answer with no body (204); still carries X-GitHub-Request-Id. */
-export function sendEmpty(res: ServerResponse, status: number, headers: Readonly<Record<string, string>> = {}): void {
+export function sendEmpty(res: ForgeResponse, status: number, headers: Readonly<Record<string, string>> = {}): void {
   res.writeHead(status, { 'x-github-request-id': nextRequestId(), ...headers });
   res.end();
 }
 
 /** An error body: always {"message": string}. */
-export function sendError(res: ServerResponse, status: number, message: string): void {
+export function sendError(res: ForgeResponse, status: number, message: string): void {
   sendJson(res, status, { message });
 }
 
 /** The standard JSON 404, also used by app.ts for unmounted prefixes. */
-export function sendNotFound(res: ServerResponse): void {
+export function sendNotFound(res: ForgeResponse): void {
   sendError(res, 404, 'Not Found');
 }
 
 // ── Request plumbing ──────────────────────────────────────────────────────────
 
 /** The request's own origin (scheme + Host header) for absolute Link/URL fields. */
-function originOf(req: IncomingMessage): string {
+function originOf(req: ForgeRequest): string {
   const host = req.headers.host ?? '127.0.0.1';
   return `http://${host}`;
 }
@@ -202,7 +202,7 @@ export interface ParsedRequestUrl {
 
 const FAST_URL_CHARS = /^[A-Za-z0-9\-._~:/?#@!$&'()*+,;=%[\]]+$/;
 
-export function parseRequestUrl(req: IncomingMessage): ParsedRequestUrl {
+export function parseRequestUrl(req: ForgeRequest): ParsedRequestUrl {
   const raw = req.url ?? '/';
   if (
     raw.startsWith('/') &&
@@ -288,7 +288,7 @@ class MalformedBodyError extends Error {}
  * as git-http.ts readBody — the async-iterator machinery costs a promise per
  * chunk and showed up in the profile.
  */
-async function readJsonBody(req: IncomingMessage): Promise<JsonObject> {
+async function readJsonBody(req: ForgeRequest): Promise<JsonObject> {
   const chunks: Buffer[] = [];
   let total = 0;
   const body = await new Promise<Buffer>((resolve, reject) => {
@@ -360,7 +360,7 @@ function paginate<T>(items: readonly T[], params: PageParams): { page: T[]; tota
  * request's query parameters (per_page/page are set to the target page). Null when
  * there is a single page. The client follows rel="next" only on the same origin.
  */
-function linkHeader(req: IncomingMessage, url: ParsedRequestUrl, params: PageParams, totalPages: number): string | null {
+function linkHeader(req: ForgeRequest, url: ParsedRequestUrl, params: PageParams, totalPages: number): string | null {
   if (totalPages <= 1) return null;
   const origin = originOf(req);
   const make = (page: number): string => {
@@ -470,7 +470,7 @@ function issueJson(issue: Issue, repo: Repo, origin: string): JsonObject {
  * name) at read time and invalidated at every issue-mutation site, so a hit
  * is always the body a fresh build would produce.
  */
-function sendIssueJson(res: ServerResponse, status: number, issue: Issue, repo: Repo, origin: string): void {
+function sendIssueJson(res: ForgeResponse, status: number, issue: Issue, repo: Repo, origin: string): void {
   const owner = repoOwnerLogin(repo);
   const cached = getCachedIssueJson(repo, issue.number, origin, owner, repo.name);
   if (cached !== undefined) {
@@ -609,7 +609,7 @@ function fileEntryJson(
 // ── The REST dispatcher ───────────────────────────────────────────────────────
 
 /** Handle one /api/v3/* request. Always answers (never throws to the caller). */
-export async function handleRest(req: IncomingMessage, res: ServerResponse, parsedUrl?: ParsedRequestUrl): Promise<void> {
+export async function handleRest(req: ForgeRequest, res: ForgeResponse, parsedUrl?: ParsedRequestUrl): Promise<void> {
   const url = parsedUrl ?? parseRequestUrl(req);
   const method = (req.method ?? 'GET').toUpperCase();
   const origin = originOf(req);
@@ -726,8 +726,8 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse, pars
 // ── Repo-scoped routes ────────────────────────────────────────────────────────
 
 async function handleRepoRoute(
-  req: IncomingMessage,
-  res: ServerResponse,
+  req: ForgeRequest,
+  res: ForgeResponse,
   url: ParsedRequestUrl,
   method: string,
   repo: Repo,
@@ -894,8 +894,8 @@ async function handleRepoRoute(
 // ── Contents ──────────────────────────────────────────────────────────────────
 
 async function handleContents(
-  req: IncomingMessage,
-  res: ServerResponse,
+  req: ForgeRequest,
+  res: ForgeResponse,
   url: ParsedRequestUrl,
   method: string,
   repo: Repo,
@@ -1048,8 +1048,8 @@ function resolveIssueLabels(repo: Repo, value: unknown): { labels: Label[]; unkn
 }
 
 async function handleIssues(
-  req: IncomingMessage,
-  res: ServerResponse,
+  req: ForgeRequest,
+  res: ForgeResponse,
   url: ParsedRequestUrl,
   method: string,
   repo: Repo,
@@ -1173,8 +1173,8 @@ function branchOf(ref: string): string {
 }
 
 async function handlePulls(
-  req: IncomingMessage,
-  res: ServerResponse,
+  req: ForgeRequest,
+  res: ForgeResponse,
   url: ParsedRequestUrl,
   method: string,
   repo: Repo,

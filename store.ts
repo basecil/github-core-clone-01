@@ -85,7 +85,7 @@
 //   bumpGeneration(repo)         — object-store write: generation += 1, fetch cache cleared
 //   getCachedFetch(repo, key) / setCachedFetch(repo, key, body) — fetch responses
 
-import type { IncomingMessage } from 'node:http';
+import type { ForgeRequest } from './forge-http.ts';
 import type { ParsedCommit, TreeEntry } from './git-object.ts';
 
 // ── Viewer learning ─────────────────────────────────────────────────────────────
@@ -176,7 +176,7 @@ export function shopTokenConfigured(): boolean {
 }
 
 /** True iff the request carries `Authorization: Bearer <MAKEFUN_SHOP_TOKEN>` exactly. */
-export function checkAuth(req: IncomingMessage): boolean {
+export function checkAuth(req: ForgeRequest): boolean {
   if (SHOP_TOKEN === '') return false;
   return req.headers.authorization === EXPECTED_AUTH_HEADER;
 }
