@@ -282,17 +282,39 @@ export function splitSegments(pathname: string): string[] {
 
 class MalformedBodyError extends Error {}
 
-/** Read the request body (≤10 MB) and parse it as JSON; {} when empty. */
+/**
+ * Read the request body (≤10 MB) and parse it as JSON; {} when empty. Uses
+ * 'data'/'end' listeners rather than `for await` (perf round 3): same reason
+ * as git-http.ts readBody — the async-iterator machinery costs a promise per
+ * chunk and showed up in the profile.
+ */
 async function readJsonBody(req: IncomingMessage): Promise<JsonObject> {
   const chunks: Buffer[] = [];
   let total = 0;
-  for await (const chunk of req) {
-    const buffer = chunk as Buffer;
-    total += buffer.length;
-    if (total > MAX_BODY_BYTES) throw new MalformedBodyError('request body too large');
-    chunks.push(buffer);
-  }
-  const text = Buffer.concat(chunks).toString('utf8');
+  const body = await new Promise<Buffer>((resolve, reject) => {
+    let failed = false;
+    req.on('data', (chunk: Buffer) => {
+      if (failed) return;
+      total += chunk.length;
+      if (total > MAX_BODY_BYTES) {
+        failed = true;
+        req.destroy();
+        reject(new MalformedBodyError('request body too large'));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.once('end', () => {
+      if (!failed) resolve(Buffer.concat(chunks));
+    });
+    req.once('error', (err: Error) => {
+      if (!failed) {
+        failed = true;
+        reject(err);
+      }
+    });
+  });
+  const text = body.toString('utf8');
   if (text.trim() === '') return {};
   let parsed: unknown;
   try {

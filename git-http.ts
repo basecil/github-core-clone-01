@@ -73,17 +73,38 @@ function oneLine(value: string): string {
 
 // ── Request plumbing ──────────────────────────────────────────────────────────
 
-/** Read the request body (≤64 MB); throws on overflow. */
+/**
+ * Read the request body (≤64 MB); throws on overflow. Uses 'data'/'end'
+ * listeners rather than `for await` (perf round 3): the async-iterator
+ * machinery (createAsyncIterator) showed up in the push profile, and the
+ * listener form allocates nothing per chunk beyond the chunk itself.
+ */
 async function readBody(req: IncomingMessage): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let total = 0;
-  for await (const chunk of req) {
-    const buffer = chunk as Buffer;
-    total += buffer.length;
-    if (total > MAX_GIT_BODY_BYTES) throw new Error('request body too large');
-    chunks.push(buffer);
-  }
-  return Buffer.concat(chunks);
+  return new Promise<Buffer>((resolve, reject) => {
+    let failed = false;
+    req.on('data', (chunk: Buffer) => {
+      if (failed) return;
+      total += chunk.length;
+      if (total > MAX_GIT_BODY_BYTES) {
+        failed = true;
+        req.destroy();
+        reject(new Error('request body too large'));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.once('end', () => {
+      if (!failed) resolve(Buffer.concat(chunks));
+    });
+    req.once('error', (err: Error) => {
+      if (!failed) {
+        failed = true;
+        reject(err);
+      }
+    });
+  });
 }
 
 /** Answer with a git content type; still carries X-GitHub-Request-Id like every reply. */

@@ -73,13 +73,22 @@ export function createApp(): Server {
 
     for (const mount of mounts) {
       if (!mount.test(path)) continue;
-      Promise.resolve()
-        .then(() => mount.handler(req, res, url))
-        .catch(() => {
-          // A handler bug must never take the server down or hang the client.
-          if (!res.headersSent) sendError(res, 500, 'Internal Server Error');
-          else res.end();
-        });
+      // Invoke the handler directly (perf round 3): the old
+      // Promise.resolve().then(() => handler(...)) cost a microtask hop and a
+      // promise per request. Semantics unchanged — a sync throw and a rejected
+      // promise both answer 500 and keep the server up.
+      const onHandlerError = (): void => {
+        if (!res.headersSent) sendError(res, 500, 'Internal Server Error');
+        else res.end();
+      };
+      let result: Promise<void> | void;
+      try {
+        result = mount.handler(req, res, url);
+      } catch {
+        onHandlerError();
+        return;
+      }
+      if (result !== undefined) result.catch(onHandlerError);
       return;
     }
 

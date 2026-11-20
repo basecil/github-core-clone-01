@@ -46,16 +46,25 @@ export function encodePktLine(payload: string | Buffer): Buffer {
   return Buffer.concat([header, data]);
 }
 
+/**
+ * The three control packets as module-level constants (perf round 3): callers
+ * only ever pass them to Buffer.concat, which copies, so sharing one instance
+ * is safe — and saves a Buffer allocation on every flush/delim/response-end.
+ */
+const PKT_FLUSH = Buffer.from('0000', 'ascii');
+const PKT_DELIM = Buffer.from('0001', 'ascii');
+const PKT_RESPONSE_END = Buffer.from('0002', 'ascii');
+
 export function pktFlush(): Buffer {
-  return Buffer.from('0000', 'ascii');
+  return PKT_FLUSH;
 }
 
 export function pktDelim(): Buffer {
-  return Buffer.from('0001', 'ascii');
+  return PKT_DELIM;
 }
 
 export function pktResponseEnd(): Buffer {
-  return Buffer.from('0002', 'ascii');
+  return PKT_RESPONSE_END;
 }
 
 /** Encode a mixed sequence; the string 'flush'/'delim'/'response-end' are the control packets. */
